@@ -1,0 +1,27 @@
+# Python / runtime caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local virtual environment
+.venv/
+
+# Local machine/runtime configuration
+.env
+*.log
+
+# Robot deployment artifacts and checkpoints
+models/
+ckpt/
+record/
+debug/
+*.onnx
+*.pt
+*.jit
+*.pth
+
+# Local backups and temporary files
+backup_*/
+.DS_Store
