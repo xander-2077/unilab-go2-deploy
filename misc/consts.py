@@ -121,8 +121,33 @@ real_idx_to_sim_idx = [
 
 q0_sim = [name_to_q0[name] for name in sim_index_to_name]
 q0_real = [name_to_q0[id_to_name[real_index_to_id[i]]] for i in range(num_joints)]
+stand_q_real = [
+    0.0, 0.8, -1.5,
+    0.0, 0.8, -1.5,
+    0.0, 0.8, -1.5,
+    0.0, 0.8, -1.5,
+]
+stand_recover_q_real = [
+    0.0, 1.36, -2.65,
+    0.0, 1.36, -2.65,
+    0.0, 1.36, -2.65,
+    0.0, 1.36, -2.65,
+]
+stand_kp_real = [
+    60.0, 80.0, 80.0,
+    60.0, 80.0, 80.0,
+    60.0, 80.0, 80.0,
+    60.0, 80.0, 80.0,
+]
+stand_kd_real = [
+    5.0, 4.0, 4.0,
+    5.0, 4.0, 4.0,
+    5.0, 4.0, 4.0,
+    5.0, 4.0, 4.0,
+]
 real_position_low = [sim_position_low[i] for i in real_idx_to_sim_idx]
 real_position_high = [sim_position_high[i] for i in real_idx_to_sim_idx]
+real_torque_limits = [torque_limits[i] for i in real_idx_to_sim_idx]
 
 clip_actions_low = [
     low - q0 for low, q0 in zip(sim_position_low, q0_sim)

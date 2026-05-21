@@ -38,7 +38,15 @@ class RobotObservation:
 
 
 class Robot():
-    def __init__(self, use_uwb=False, is_sim=False, q_msg=None, network_interface=None):
+    def __init__(
+        self,
+        use_uwb=False,
+        is_sim=False,
+        q_msg=None,
+        network_interface=None,
+        torque_limit_scale=0.65,
+        torque_limit_enabled=True,
+    ):
         """
         Args:
             use_uwb: whether to use direction dog -> tag as command and ignore remote controller
@@ -57,8 +65,16 @@ class Robot():
         self.kd = 0.5
         self.run_kp = 35.0
         self.run_kd = 0.5
-        self.stand_kp = 18.0
-        self.stand_kd = 1.5
+        self.stand_kp = list(stand_kp_real)
+        self.stand_kd = list(stand_kd_real)
+        self.torque_limit_enabled = bool(torque_limit_enabled)
+        self.torque_limit_scale = float(torque_limit_scale)
+        self.torque_limits_real = [
+            max(0.0, float(limit) * self.torque_limit_scale)
+            for limit in real_torque_limits
+        ]
+        self.torque_limit_hits = 0
+        self.max_estimated_tau = 0.0
 
         self.Δq_real = [None for _ in range(12)]  # in real order
         self.q_setted = False
@@ -175,16 +191,63 @@ class Robot():
             0.005
         ):  # wait for 5ms until stopped.set() is called
             for i in range(12):
+                q_cmd, kp_cmd, kd_cmd, tau_est = self._limited_pd_command(
+                    i, q0_real[i] + self.Δq_real[i]
+                )
                 cmd.motor_cmd[i].mode = 0x01  # (PMSM) mode
-                cmd.motor_cmd[i].q = q0_real[i] + self.Δq_real[i]
+                cmd.motor_cmd[i].q = q_cmd
                 cmd.motor_cmd[i].dq = 0
-                cmd.motor_cmd[i].kp = self.kp
-                cmd.motor_cmd[i].kd = self.kd
+                cmd.motor_cmd[i].kp = kp_cmd
+                cmd.motor_cmd[i].kd = kd_cmd
                 cmd.motor_cmd[i].tau = 0
+                self.max_estimated_tau = max(self.max_estimated_tau, abs(tau_est))
             # print(f"q0_real: {q0_real}")
             # print(f"Δq_real: {self.Δq_real}")
             cmd.crc = self.crc.Crc(cmd)
             self._lowcmd_pub.Write(cmd)
+
+    def _limited_pd_command(self, motor_idx: int, requested_q: float):
+        q_cmd = min(
+            max(float(requested_q), float(real_position_low[motor_idx])),
+            float(real_position_high[motor_idx]),
+        )
+        kp_cmd = self._gain_at(self.kp, motor_idx)
+        kd_cmd = self._gain_at(self.kd, motor_idx)
+        if self.motor_state_real is None:
+            return q_cmd, kp_cmd, kd_cmd, 0.0
+
+        state = self.motor_state_real[motor_idx]
+        q_meas = float(state.q)
+        dq = float(state.dq)
+        tau_est = kp_cmd * (q_cmd - q_meas) - kd_cmd * dq
+        if not self.torque_limit_enabled:
+            return q_cmd, kp_cmd, kd_cmd, tau_est
+
+        limit = float(self.torque_limits_real[motor_idx])
+        if limit <= 0.0:
+            return q_cmd, kp_cmd, kd_cmd, tau_est
+
+        if abs(tau_est) <= limit:
+            return q_cmd, kp_cmd, kd_cmd, tau_est
+
+        self.torque_limit_hits += 1
+        tau_limited = max(min(tau_est, limit), -limit)
+        if kp_cmd > 1.0e-6:
+            q_cmd = q_meas + (tau_limited + kd_cmd * dq) / kp_cmd
+            q_cmd = min(
+                max(q_cmd, float(real_position_low[motor_idx])),
+                float(real_position_high[motor_idx]),
+            )
+            tau_est = kp_cmd * (q_cmd - q_meas) - kd_cmd * dq
+            if abs(tau_est) <= limit:
+                return q_cmd, kp_cmd, kd_cmd, tau_est
+
+        if abs(dq) > 1.0e-6:
+            kd_cmd = min(kd_cmd, limit / abs(dq))
+        if kp_cmd > 1.0e-6:
+            q_cmd = q_meas
+        tau_est = kp_cmd * (q_cmd - q_meas) - kd_cmd * dq
+        return q_cmd, kp_cmd, kd_cmd, tau_est
 
     def get_obs(self):
         # joint pos & vel
@@ -238,9 +301,42 @@ class Robot():
         self.kd = 10.0
 
     def to_stand(self):
-        self.Δq_real = [0.0 for _ in range(12)]
+        self.Δq_real = self._absolute_pose_to_offset(stand_q_real)
         self.kp = self.stand_kp
         self.kd = self.stand_kd
+
+    @staticmethod
+    def _absolute_pose_to_offset(target_q_real):
+        return [
+            float(target_q) - float(q0)
+            for target_q, q0 in zip(target_q_real, q0_real)
+        ]
+
+    @staticmethod
+    def _gain_at(gain, motor_idx: int) -> float:
+        if isinstance(gain, (list, tuple)):
+            if len(gain) == 1:
+                return float(gain[0])
+            return float(gain[motor_idx])
+        return float(gain)
+
+    @staticmethod
+    def _copy_gain(gain):
+        if isinstance(gain, (list, tuple)):
+            if len(gain) == 1:
+                return float(gain[0])
+            return [float(v) for v in gain]
+        return float(gain)
+
+    @classmethod
+    def _interpolate_gain(cls, start_gain, end_gain, alpha: float):
+        if isinstance(start_gain, (list, tuple)) or isinstance(end_gain, (list, tuple)):
+            return [
+                cls._gain_at(start_gain, i)
+                + (cls._gain_at(end_gain, i) - cls._gain_at(start_gain, i)) * alpha
+                for i in range(12)
+            ]
+        return float(start_gain) + (float(end_gain) - float(start_gain)) * alpha
 
     def stand_up(
         self,
@@ -249,22 +345,39 @@ class Robot():
         start_kd: float,
         end_kp: float,
         end_kd: float,
+        target_q_real=None,
+        via_q_real=None,
     ):
-        start_offset = list(self.Δq_real)
-        duration = max(float(duration), 0.02)
-        begin = time.perf_counter()
+        if target_q_real is None:
+            target_q_real = stand_q_real
+        target_offsets = []
+        if via_q_real is not None:
+            target_offsets.append(self._absolute_pose_to_offset(via_q_real))
+        target_offsets.append(self._absolute_pose_to_offset(target_q_real))
 
-        while True:
-            alpha = min((time.perf_counter() - begin) / duration, 1.0)
-            smooth = alpha * alpha * (3.0 - 2.0 * alpha)
-            self.kp = start_kp + (end_kp - start_kp) * smooth
-            self.kd = start_kd + (end_kd - start_kd) * smooth
-            self.Δq_real = [(1.0 - smooth) * q for q in start_offset]
-            if alpha >= 1.0:
-                break
-            time.sleep(0.02)
+        current_offset = list(self.Δq_real)
+        total_duration = max(float(duration), 0.02)
+        segment_duration = max(total_duration / len(target_offsets), 0.02)
 
-        self.Δq_real = [0.0 for _ in range(12)]
+        for segment_idx, target_offset in enumerate(target_offsets):
+            start_offset = list(current_offset)
+            begin = time.perf_counter()
+            while True:
+                alpha = min((time.perf_counter() - begin) / segment_duration, 1.0)
+                smooth = alpha * alpha * (3.0 - 2.0 * alpha)
+                total_alpha = (segment_idx + smooth) / len(target_offsets)
+                self.kp = self._interpolate_gain(start_kp, end_kp, total_alpha)
+                self.kd = self._interpolate_gain(start_kd, end_kd, total_alpha)
+                self.Δq_real = [
+                    (1.0 - smooth) * start + smooth * target
+                    for start, target in zip(start_offset, target_offset)
+                ]
+                if alpha >= 1.0:
+                    break
+                time.sleep(0.02)
+            current_offset = target_offset
+
+        self.Δq_real = target_offsets[-1]
         self.kp = end_kp
         self.kd = end_kd
 
@@ -280,9 +393,20 @@ class Robot():
         self.run_kp = float(kp)
         self.run_kd = float(kd)
 
-    def set_stand_gains(self, kp: float, kd: float):
-        self.stand_kp = float(kp)
-        self.stand_kd = float(kd)
+    def set_stand_gains(self, kp, kd):
+        self.stand_kp = self._copy_gain(kp)
+        self.stand_kd = self._copy_gain(kd)
+
+    def set_torque_limit(self, enabled: bool, scale: float, reset_stats: bool = True):
+        self.torque_limit_enabled = bool(enabled)
+        self.torque_limit_scale = float(scale)
+        self.torque_limits_real = [
+            max(0.0, float(limit) * self.torque_limit_scale)
+            for limit in real_torque_limits
+        ]
+        if reset_stats:
+            self.torque_limit_hits = 0
+            self.max_estimated_tau = 0.0
 
     def stop(self):
         self.stopped.set()
