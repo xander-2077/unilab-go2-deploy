@@ -17,6 +17,10 @@ def _robot_obs(
     joint_velocity: np.ndarray | None = None,
     gyroscope: np.ndarray | None = None,
     quaternion: list[float] | None = None,
+    lx: float = 0.0,
+    ly: float = 0.0,
+    rx: float = 0.0,
+    ry: float = 0.0,
     L1: bool = False,
     L2: bool = False,
 ) -> RobotObservation:
@@ -40,10 +44,10 @@ def _robot_obs(
         roll=0.0,
         pitch=0.0,
         yaw=0.0,
-        lx=0.0,
-        ly=0.0,
-        rx=0.0,
-        ry=0.0,
+        lx=lx,
+        ly=ly,
+        rx=rx,
+        ry=ry,
         L1=L1,
         L2=L2,
     )
@@ -59,6 +63,7 @@ def _args(**overrides):
         "policy": None,
         "policy_root": deploy.DEFAULT_POLICY_ROOT,
         "policy_ckpt": deploy.DEFAULT_POLICY_CKPT,
+        "velocity_policy": deploy.DEFAULT_VELOCITY_POLICY_PATH,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -144,6 +149,57 @@ class Go2FootStandAbiTest(unittest.TestCase):
 
         self.assertEqual(env.observe_count, 5)
 
+    def test_repress_switch_arms_only_after_release(self) -> None:
+        armed, should_switch = deploy._update_repress_switch(True, False)
+        self.assertFalse(armed)
+        self.assertFalse(should_switch)
+
+        armed, should_switch = deploy._update_repress_switch(False, armed)
+        self.assertTrue(armed)
+        self.assertFalse(should_switch)
+
+        armed, should_switch = deploy._update_repress_switch(True, armed)
+        self.assertTrue(armed)
+        self.assertTrue(should_switch)
+
+    def test_policy_state_machine_switches_from_velocity_to_footstand_once(self) -> None:
+        state_machine = deploy.PolicyStateMachine()
+
+        self.assertEqual(state_machine.update(_robot_obs(L1=True)), deploy.VELOCITY_STATE)
+        self.assertEqual(state_machine.update(_robot_obs(L1=False)), deploy.VELOCITY_STATE)
+        self.assertEqual(state_machine.update(_robot_obs(L1=True)), deploy.FOOTSTAND_STATE)
+        self.assertEqual(state_machine.update(_robot_obs(L1=False)), deploy.FOOTSTAND_STATE)
+
+    def test_footstand_joint_logger_writes_ckpt_and_beijing_time_csv(self) -> None:
+        with TemporaryDirectory() as tmp:
+            log_dir = Path(tmp)
+            policy_path = (
+                Path("models")
+                / "Go2FootStand"
+                / "2026-05-21_14-16-56_mujoco"
+                / "policy.onnx"
+            )
+            logger = deploy.FootstandJointLogger(log_dir, policy_path, flush_every=1)
+            joint_position = np.linspace(-0.01, 0.01, deploy.ACT_DIM, dtype=np.float32)
+            joint_velocity = np.linspace(0.1, 1.2, deploy.ACT_DIM, dtype=np.float32)
+
+            path = logger.start()
+            logger.log(_robot_obs(joint_position=joint_position, joint_velocity=joint_velocity))
+            logger.close()
+
+            self.assertIn("2026-05-21_14-16-56_mujoco", path.name)
+            self.assertIn("BJT", path.name)
+            rows = path.read_text().strip().splitlines()
+            self.assertEqual(len(rows), 2)
+            header = rows[0].split(",")
+            values = rows[1].split(",")
+            self.assertEqual(header[0:2], ["beijing_time", "elapsed_s"])
+            self.assertEqual(header[2], "q_abs_FL_hip_joint")
+            self.assertEqual(header[14], "dq_FL_hip_joint")
+            expected_q_abs = deploy.Q0_SIM + joint_position
+            self.assertAlmostEqual(float(values[2]), float(expected_q_abs[0]), places=6)
+            self.assertAlmostEqual(float(values[14]), float(joint_velocity[0]), places=6)
+
     def test_build_env_uses_unfiltered_footstand_action_abi_by_default(self) -> None:
         env = deploy.build_env(deploy.Go2FootStandEnv.obs_dim, None, _args())
 
@@ -155,6 +211,85 @@ class Go2FootStandAbiTest(unittest.TestCase):
         action = np.full(deploy.ACT_DIM, 0.5, dtype=np.float32)
         env.advance(action, set_act=False)
         np.testing.assert_allclose(env.current_actions, action)
+
+    def test_walk_these_ways_dimensions_match_legacy_deploy_contract(self) -> None:
+        self.assertEqual(deploy.WTW_FRAME_OBS_DIM, 70)
+        self.assertEqual(deploy.WTW_HISTORY_LEN, 30)
+        self.assertEqual(deploy.WTW_COMMAND_DIM, 15)
+        self.assertEqual(deploy.WalkTheseWaysEnv.obs_dim, 2100)
+        self.assertEqual(deploy.WTW_BASE_COMMAND.shape, (deploy.WTW_COMMAND_DIM,))
+
+        env = deploy.build_env(deploy.WalkTheseWaysEnv.obs_dim, None, _args())
+        self.assertIsInstance(env, deploy.WalkTheseWaysEnv)
+
+    def test_walk_these_ways_observation_layout_matches_legacy_deploy(self) -> None:
+        env = deploy.WalkTheseWaysEnv(None, np.asarray([0.5, 0.0, 0.0], dtype=np.float32))
+        joint_position = np.linspace(-0.06, 0.06, deploy.ACT_DIM, dtype=np.float32)
+        joint_velocity = np.linspace(0.1, 1.2, deploy.ACT_DIM, dtype=np.float32)
+
+        obs, _ = env.observe(
+            _robot_obs(
+                joint_position=joint_position,
+                joint_velocity=joint_velocity,
+                lx=0.25,
+                ly=0.4,
+                rx=-0.3,
+            )
+        )
+
+        expected_command = deploy.WTW_BASE_COMMAND.copy()
+        expected_command[0:3] = [0.4, -0.25, 0.3]
+        expected_clock = np.sin(2.0 * np.pi * deploy.WTW_FOOT_GAIT_OFFSETS).astype(
+            np.float32
+        )
+        expected_frame = np.concatenate(
+            [
+                np.array([0.0, 0.0, -1.0], dtype=np.float32),
+                expected_command,
+                joint_position,
+                joint_velocity * 0.05,
+                np.zeros(deploy.ACT_DIM, dtype=np.float32),
+                np.zeros(deploy.ACT_DIM, dtype=np.float32),
+                expected_clock,
+            ],
+            dtype=np.float32,
+        )
+        frames = obs.reshape(deploy.WTW_HISTORY_LEN, deploy.WTW_FRAME_OBS_DIM)
+        np.testing.assert_allclose(frames[:-1], 0.0)
+        np.testing.assert_allclose(frames[-1], expected_frame, atol=1.0e-6)
+
+    def test_walk_these_ways_joystick_command_stays_near_training_range(self) -> None:
+        env = deploy.WalkTheseWaysEnv(None, np.asarray([2.0, -2.0, 2.0], dtype=np.float32))
+
+        joystick_command = env._command_from_robot(_robot_obs(lx=2.0, ly=2.0, rx=-2.0))
+        np.testing.assert_allclose(joystick_command[0:3], [1.0, -0.6, 1.0])
+
+        env.joystick_command = False
+        fixed_command = env._command_from_robot(_robot_obs())
+        np.testing.assert_allclose(fixed_command[0:3], [1.0, -0.6, 1.0])
+
+    def test_walk_these_ways_actions_are_scaled_in_sim_order(self) -> None:
+        env = deploy.WalkTheseWaysEnv(None, np.asarray([0.5, 0.0, 0.0], dtype=np.float32))
+        env.observe(_robot_obs())
+
+        raw_action = np.array(
+            [-2.0, -1.0, -0.5, 0.0, 0.25, 0.5, 0.75, 1.0, 2.0, -0.25, 0.4, -0.6],
+            dtype=np.float32,
+        )
+        target_rel = env.advance(raw_action, set_act=False)
+        expected_clipped = np.clip(raw_action, deploy.CLIP_ACTIONS_LOW, deploy.CLIP_ACTIONS_HIGH)
+        expected_scaled_sim = (
+            expected_clipped * deploy.WTW_ACTION_SCALE * deploy.WTW_HIP_SCALE_REDUCTION
+        )
+
+        np.testing.assert_allclose(env.current_actions, expected_clipped)
+        np.testing.assert_allclose(env.action_scaled, expected_scaled_sim)
+        np.testing.assert_allclose(target_rel, expected_scaled_sim[deploy.DOF_TO_CTRL])
+
+        obs, _ = env.observe(_robot_obs())
+        frame = obs.reshape(deploy.WTW_HISTORY_LEN, deploy.WTW_FRAME_OBS_DIM)[-1]
+        np.testing.assert_allclose(frame[42:54], expected_clipped)
+        np.testing.assert_allclose(frame[54:66], 0.0)
 
     def test_footstand_observation_frame_layout_and_reset_history(self) -> None:
         env = deploy.Go2FootStandEnv(None)
@@ -245,6 +380,30 @@ class Go2FootStandAbiTest(unittest.TestCase):
 
         policy, input_dim = deploy.load_policy(policy_path)
         self.assertEqual(input_dim, deploy.Go2FootStandEnv.obs_dim)
+
+        action = policy(np.zeros(input_dim, dtype=np.float32))
+        self.assertEqual(action.shape, (deploy.ACT_DIM,))
+        self.assertTrue(np.all(np.isfinite(action)))
+
+    def test_default_velocity_walk_these_ways_has_expected_abi_shape(self) -> None:
+        policy_path = Path(deploy.DEFAULT_VELOCITY_POLICY_PATH)
+        if not policy_path.exists():
+            self.skipTest(f"missing deployment artifact: {policy_path}")
+
+        policy, input_dim = deploy.load_policy(policy_path)
+        self.assertEqual(input_dim, deploy.WalkTheseWaysEnv.obs_dim)
+
+        action = policy(np.zeros(input_dim, dtype=np.float32))
+        self.assertEqual(action.shape, (deploy.ACT_DIM,))
+        self.assertTrue(np.all(np.isfinite(action)))
+
+    def test_legacy_go2_joystick_onnx_has_expected_abi_shape(self) -> None:
+        policy_path = Path("models/Go2JoystickFlat/policy.onnx")
+        if not policy_path.exists():
+            self.skipTest(f"missing deployment artifact: {policy_path}")
+
+        policy, input_dim = deploy.load_policy(policy_path)
+        self.assertEqual(input_dim, deploy.Go2JoystickFlatEnv.obs_dim)
 
         action = policy(np.zeros(input_dim, dtype=np.float32))
         self.assertEqual(action.shape, (deploy.ACT_DIM,))

@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import re
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
 import onnxruntime as ort
+import torch
 
 from misc.consts import (
+    clip_actions_high,
+    clip_actions_low,
     id_to_name,
     q0_real,
     q0_sim,
@@ -16,6 +22,7 @@ from misc.consts import (
     real_index_to_id,
     real_position_high,
     real_position_low,
+    sim_index_to_name,
     stand_kd_real,
     stand_kp_real,
     stand_q_real,
@@ -34,10 +41,35 @@ CTRL_DT = 0.02
 GAIT_FREQUENCY = 2.0
 JOYSTICK_ACTION_SCALE = 0.25
 FOOTSTAND_ACTION_SCALE = 0.3
+WTW_FRAME_OBS_DIM = 70
+WTW_HISTORY_LEN = 30
+WTW_OBS_DIM = WTW_FRAME_OBS_DIM * WTW_HISTORY_LEN
+WTW_COMMAND_DIM = 15
+WTW_ACTION_SCALE = 0.25
+# Conservative low-frequency trot preset. Keep these command values and the
+# deployment gait clock in sync so the policy command and phase observation agree.
+WTW_GAIT_FREQUENCY = 2.0
+WTW_GAIT_PHASE = 0.5
+WTW_GAIT_OFFSET = 0.0
+WTW_GAIT_BOUND = 0.0
+WTW_GAIT_DURATION = 0.5
+WTW_FOOT_SWING_HEIGHT = 0.06 * 0.15
+WTW_COMMAND_LOW = np.asarray([-1.0, -0.6, -1.0], dtype=np.float32)
+WTW_COMMAND_HIGH = np.asarray([1.0, 0.6, 1.0], dtype=np.float32)
+WTW_BODY_FILE = "body_latest.jit"
+WTW_ADAPTATION_FILE = "adaptation_module_latest.jit"
+DEFAULT_VELOCITY_POLICY_PATH = Path("models/walk_these_ways")
 DEFAULT_POLICY_ROOT = Path("models/Go2FootStand")
 DEFAULT_POLICY_FILE_NAME = "policy.onnx"
 DEFAULT_POLICY_CKPT = "latest"
 DEFAULT_POLICY_PATH = DEFAULT_POLICY_ROOT / DEFAULT_POLICY_FILE_NAME
+DEFAULT_POST_STAND_DELAY = 2.0
+DEFAULT_RELAX_HOLD_SECONDS = 0.0
+VELOCITY_STATE = "velocity"
+FOOTSTAND_STATE = "footstand"
+FOOTSTAND_SWITCH_BUTTON = "L1"
+DEFAULT_LOG_DIR = Path("logs")
+BEIJING_TZ = timezone(timedelta(hours=8), name="BJT")
 
 Q0_SIM = np.asarray(q0_sim, dtype=np.float32)
 Q0_REAL = np.asarray(q0_real, dtype=np.float32)
@@ -47,7 +79,43 @@ STAND_KP_REAL = np.asarray(stand_kp_real, dtype=np.float32)
 STAND_KD_REAL = np.asarray(stand_kd_real, dtype=np.float32)
 REAL_POSITION_LOW = np.asarray(real_position_low, dtype=np.float32)
 REAL_POSITION_HIGH = np.asarray(real_position_high, dtype=np.float32)
+CLIP_ACTIONS_LOW = np.asarray(clip_actions_low, dtype=np.float32)
+CLIP_ACTIONS_HIGH = np.asarray(clip_actions_high, dtype=np.float32)
 DOF_TO_CTRL = np.asarray(real_idx_to_sim_idx, dtype=np.int32)
+# WTW reduces hip action amplitude before converting sim-order actions to Unitree real order.
+WTW_HIP_SCALE_REDUCTION = np.asarray([0.5, 1.0, 1.0] * 4, dtype=np.float32)
+# Gait clock offsets in sim leg order: FL, FR, RL, RR.
+WTW_FOOT_GAIT_OFFSETS = np.asarray(
+    [
+        WTW_GAIT_PHASE + WTW_GAIT_OFFSET + WTW_GAIT_BOUND,
+        WTW_GAIT_OFFSET,
+        WTW_GAIT_BOUND,
+        WTW_GAIT_PHASE,
+    ],
+    dtype=np.float32,
+)
+# 15-dim WalkTheseWays command layout copied from the legacy deployment script.
+# Slots 4-8 were not commented there; names below follow common WTW gait parameter usage.
+WTW_BASE_COMMAND = np.asarray(
+    [
+        0.0,  # command[0]: x velocity; overwritten from joystick ly * 2.0.
+        0.0,  # command[1]: y velocity; overwritten from joystick -lx * 2.0.
+        0.0,  # command[2]: yaw velocity; overwritten from joystick -rx.
+        0.0,  # command[3]: body height.
+        WTW_GAIT_FREQUENCY,  # command[4]: gait frequency.
+        WTW_GAIT_PHASE,  # command[5]: gait phase.
+        WTW_GAIT_OFFSET,  # command[6]: gait offset.
+        WTW_GAIT_BOUND,  # command[7]: gait bound.
+        WTW_GAIT_DURATION,  # command[8]: gait duration.
+        WTW_FOOT_SWING_HEIGHT,  # command[9]: foot swing height.
+        0.0,  # command[10]: body pitch.
+        0.0,  # command[11]: body roll.
+        0.25,  # command[12]: stance width.
+        0.42803,  # command[13]: stance length.
+        0.0,  # command[14]: unknown/reserved legacy slot.
+    ],
+    dtype=np.float32,
+)
 
 PolicyFn = Callable[[np.ndarray], np.ndarray]
 
@@ -115,7 +183,7 @@ def _fixed_dim(shape: list, axis: int, label: str) -> int:
     return dim
 
 
-def load_policy(path: Path) -> tuple[PolicyFn, int]:
+def load_onnx_policy(path: Path) -> tuple[PolicyFn, int]:
     session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
     input_meta = session.get_inputs()[0]
     output_meta = session.get_outputs()[0]
@@ -131,6 +199,55 @@ def load_policy(path: Path) -> tuple[PolicyFn, int]:
         return np.asarray(action, dtype=np.float32).reshape(ACT_DIM)
 
     return policy, input_dim
+
+
+def load_walk_these_ways_policy(path: Path) -> tuple[PolicyFn, int]:
+    if path.is_dir():
+        body_path = path / WTW_BODY_FILE
+        adaptation_path = path / WTW_ADAPTATION_FILE
+    else:
+        body_path = path
+        adaptation_path = path.parent / WTW_ADAPTATION_FILE
+
+    missing = [p for p in (body_path, adaptation_path) if not p.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "WalkTheseWays policy expects "
+            f"{WTW_BODY_FILE} and {WTW_ADAPTATION_FILE}; missing "
+            f"{', '.join(str(p) for p in missing)}"
+        )
+
+    body = torch.jit.load(str(body_path), map_location="cpu").eval()
+    adaptation_module = torch.jit.load(str(adaptation_path), map_location="cpu").eval()
+
+    with torch.no_grad():
+        zero_obs = torch.zeros(1, WTW_OBS_DIM, dtype=torch.float32)
+        latent = adaptation_module(zero_obs)
+        if tuple(latent.shape) != (1, 2):
+            raise ValueError(
+                f"Expected WalkTheseWays adaptation output shape [1, 2], got {tuple(latent.shape)}"
+            )
+        action = body(torch.cat((zero_obs, latent), dim=-1))
+        if tuple(action.shape) != (1, ACT_DIM):
+            raise ValueError(
+                f"Expected WalkTheseWays body output shape [1, {ACT_DIM}], got {tuple(action.shape)}"
+            )
+
+    def policy(obs: np.ndarray) -> np.ndarray:
+        obs = np.asarray(obs, dtype=np.float32).reshape(1, WTW_OBS_DIM)
+        obs_t = torch.from_numpy(obs)
+        with torch.no_grad():
+            latent = adaptation_module(obs_t)
+            action = body(torch.cat((obs_t, latent), dim=-1))
+        return action.detach().cpu().numpy().reshape(ACT_DIM).astype(np.float32)
+
+    return policy, WTW_OBS_DIM
+
+
+def load_policy(path: Path) -> tuple[PolicyFn, int]:
+    if path.is_dir() or path.suffix == ".jit":
+        return load_walk_these_ways_policy(path)
+    return load_onnx_policy(path)
 
 
 def _dof_to_ctrl_order(values: np.ndarray) -> np.ndarray:
@@ -162,6 +279,101 @@ def _filter_action(
 
 def _defaulted(value: Optional[float], default: float) -> float:
     return default if value is None else float(value)
+
+
+def _ckpt_label_from_policy_path(policy_path: Path) -> str:
+    if policy_path.name == DEFAULT_POLICY_FILE_NAME:
+        label = policy_path.parent.name
+    else:
+        label = policy_path.stem
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("_") or "policy"
+
+
+def _update_repress_switch(button_pressed: bool, armed: bool) -> tuple[bool, bool]:
+    if not button_pressed:
+        return True, False
+    if armed:
+        return True, True
+    return False, False
+
+
+class PolicyStateMachine:
+    def __init__(self, switch_button: str = FOOTSTAND_SWITCH_BUTTON):
+        self.state = VELOCITY_STATE
+        self.switch_button = switch_button
+        self.switch_armed = False
+
+    def update(self, robot_obs: RobotObservation) -> str:
+        if self.state != VELOCITY_STATE:
+            return self.state
+
+        self.switch_armed, should_switch = _update_repress_switch(
+            bool(getattr(robot_obs, self.switch_button)),
+            self.switch_armed,
+        )
+        if should_switch:
+            self.state = FOOTSTAND_STATE
+        return self.state
+
+
+class FootstandJointLogger:
+    def __init__(self, log_dir: Path, policy_path: Path, flush_every: int = 25):
+        self.log_dir = log_dir
+        self.policy_path = policy_path
+        self.flush_every = int(flush_every)
+        self.path: Path | None = None
+        self._file = None
+        self._writer: csv.writer | None = None
+        self._start_perf = 0.0
+        self._rows = 0
+
+    def start(self) -> Path:
+        if self._writer is not None:
+            return self.path
+
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_label = _ckpt_label_from_policy_path(self.policy_path)
+        started_at = datetime.now(BEIJING_TZ).strftime("%Y%m%d_%H%M%S_BJT")
+        self.path = self.log_dir / f"footstand_{ckpt_label}_{started_at}.csv"
+        self._file = self.path.open("w", newline="")
+        self._writer = csv.writer(self._file)
+        self._writer.writerow(self._header())
+        self._file.flush()
+        self._start_perf = time.perf_counter()
+        self._rows = 0
+        return self.path
+
+    def _header(self) -> list[str]:
+        q_columns = [f"q_abs_{name}" for name in sim_index_to_name]
+        dq_columns = [f"dq_{name}" for name in sim_index_to_name]
+        return ["beijing_time", "elapsed_s", *q_columns, *dq_columns]
+
+    def log(self, robot_obs: RobotObservation) -> None:
+        if self._writer is None:
+            self.start()
+
+        q_rel = np.asarray(robot_obs.joint_position, dtype=np.float32).reshape(ACT_DIM)
+        q_abs = q_rel + Q0_SIM
+        dq = np.asarray(robot_obs.joint_velocity, dtype=np.float32).reshape(ACT_DIM)
+        now = datetime.now(BEIJING_TZ).isoformat(timespec="milliseconds")
+        elapsed = time.perf_counter() - self._start_perf
+        row = [
+            now,
+            f"{elapsed:.6f}",
+            *[f"{float(v):.8f}" for v in q_abs],
+            *[f"{float(v):.8f}" for v in dq],
+        ]
+        self._writer.writerow(row)
+        self._rows += 1
+        if self._file is not None and self.flush_every > 0 and self._rows % self.flush_every == 0:
+            self._file.flush()
+
+    def close(self) -> None:
+        if self._file is not None:
+            self._file.flush()
+            self._file.close()
+        self._file = None
+        self._writer = None
 
 
 def _format_real_pose(values: np.ndarray) -> str:
@@ -302,6 +514,154 @@ class Go2JoystickFlatEnv:
 
     def debug_summary(self, obs: np.ndarray) -> str:
         return f"cmd={obs[42:45].round(3).tolist()}"
+
+
+class WalkTheseWaysEnv:
+    """Deployment-side ABI adapter for the legacy walk_these_ways Go2 policy."""
+
+    name = "WalkTheseWays"
+    obs_dim = WTW_OBS_DIM
+    frame_obs_dim = WTW_FRAME_OBS_DIM
+    history_len = WTW_HISTORY_LEN
+    act_dim = ACT_DIM
+    dt = CTRL_DT
+    action_scale = WTW_ACTION_SCALE
+
+    def __init__(
+        self,
+        robot: Optional[Robot],
+        command: np.ndarray,
+        joystick_command: bool = True,
+    ):
+        self.robot = robot
+        self.command = np.asarray(command, dtype=np.float32)
+        self.joystick_command = joystick_command
+        self.current_actions = np.zeros(ACT_DIM, dtype=np.float32)
+        self.last_actions = np.zeros(ACT_DIM, dtype=np.float32)
+        self.action_scaled = np.zeros(ACT_DIM, dtype=np.float32)
+        self.gait_indices = 0.0
+        self.obs_buffer = np.zeros(
+            (self.history_len * 3, self.frame_obs_dim), dtype=np.float32
+        )
+        self.t = self.history_len
+        self.last_frame_obs = np.zeros(self.frame_obs_dim, dtype=np.float32)
+        self.last_obs = np.zeros(self.obs_dim, dtype=np.float32)
+
+    def reset_control_state(self, robot_obs: Optional[RobotObservation] = None) -> None:
+        del robot_obs
+        self.current_actions.fill(0.0)
+        self.last_actions.fill(0.0)
+        self.action_scaled.fill(0.0)
+        self.gait_indices = 0.0
+        self.obs_buffer.fill(0.0)
+        self.t = self.history_len
+        self.last_frame_obs.fill(0.0)
+        self.last_obs.fill(0.0)
+
+    def observe(self, inject_robot_obs: Optional[RobotObservation] = None):
+        if inject_robot_obs is not None:
+            robot_obs = inject_robot_obs
+        elif self.robot is not None:
+            robot_obs = self.robot.get_obs()
+        else:
+            raise ValueError("observe() needs either a robot or an injected observation")
+
+        return self.make_obs(robot_obs), robot_obs
+
+    def make_frame_obs(self, robot_obs: RobotObservation) -> np.ndarray:
+        projected_gravity = _project_gravity_down(robot_obs.quaternion)
+        commands = self._command_from_robot(robot_obs)
+        dof_pos = np.asarray(robot_obs.joint_position, dtype=np.float32).reshape(ACT_DIM)
+        dof_vel = np.asarray(robot_obs.joint_velocity, dtype=np.float32).reshape(ACT_DIM) * 0.05
+        clock = np.sin(2.0 * np.pi * (self.gait_indices + WTW_FOOT_GAIT_OFFSETS)).astype(
+            np.float32
+        )
+
+        frame_obs = np.concatenate(
+            [
+                projected_gravity,
+                commands,
+                dof_pos,
+                dof_vel,
+                self.current_actions,
+                self.last_actions,
+                clock,
+            ],
+            dtype=np.float32,
+        )
+        if frame_obs.shape != (self.frame_obs_dim,):
+            raise ValueError(
+                f"WalkTheseWays frame obs must have shape ({self.frame_obs_dim},), "
+                f"got {frame_obs.shape}"
+            )
+        return np.clip(frame_obs, -5.0, 5.0).astype(np.float32)
+
+    def make_obs(self, robot_obs: RobotObservation) -> np.ndarray:
+        frame_obs = self.make_frame_obs(robot_obs)
+        obs = self._store_frame_obs(frame_obs)
+        self.last_frame_obs = frame_obs
+        self.last_obs = obs
+        return obs
+
+    def _command_from_robot(self, robot_obs: RobotObservation) -> np.ndarray:
+        commands = WTW_BASE_COMMAND.copy()
+        if self.joystick_command:
+            velocity_command = np.asarray(
+                [
+                    robot_obs.ly,
+                    -robot_obs.lx,
+                    -robot_obs.rx,
+                ],
+                dtype=np.float32,
+            )
+        else:
+            velocity_command = np.asarray(self.command, dtype=np.float32)
+        commands[0:3] = np.clip(velocity_command, WTW_COMMAND_LOW, WTW_COMMAND_HIGH)
+        return commands
+
+    def _store_frame_obs(self, frame_obs: np.ndarray) -> np.ndarray:
+        if self.t == self.obs_buffer.shape[0]:
+            self.obs_buffer[: self.history_len] = self.obs_buffer[
+                self.t - self.history_len : self.t
+            ].copy()
+            self.t = self.history_len
+        self.obs_buffer[self.t] = frame_obs
+        self.t += 1
+        obs = self.obs_buffer[self.t - self.history_len : self.t].reshape(-1)
+        if obs.shape != (self.obs_dim,):
+            raise ValueError(f"WalkTheseWays obs must have shape ({self.obs_dim},), got {obs.shape}")
+        return obs.astype(np.float32, copy=True)
+
+    def advance(self, action: np.ndarray, set_act: bool = True) -> np.ndarray:
+        raw_action = np.asarray(action, dtype=np.float32).reshape(ACT_DIM)
+        if not np.all(np.isfinite(raw_action)):
+            raise ValueError(f"Policy produced non-finite action: {raw_action}")
+
+        raw_action = np.clip(raw_action, -10.0, 10.0).astype(np.float32)
+        clipped_action = np.clip(raw_action, CLIP_ACTIONS_LOW, CLIP_ACTIONS_HIGH).astype(
+            np.float32
+        )
+        self.last_actions = self.current_actions.copy()
+        self.current_actions = clipped_action
+        self.action_scaled = (
+            clipped_action * self.action_scale * WTW_HIP_SCALE_REDUCTION
+        ).astype(np.float32)
+        target_rel_real = self.action_scaled[DOF_TO_CTRL].astype(np.float32)
+
+        if set_act and self.robot is not None:
+            self.robot.set_act(self.action_scaled.tolist())
+
+        self.gait_indices = (self.gait_indices + WTW_GAIT_FREQUENCY * self.dt) % 1.0
+        return target_rel_real
+
+    def debug_summary(self, obs: np.ndarray) -> str:
+        del obs
+        frame = self.last_frame_obs
+        return (
+            f"cmd={frame[3:6].round(3).tolist()} "
+            f"clock={frame[-4:].round(3).tolist()} "
+            f"scaled=({self.action_scaled.min():.3f},{self.action_scaled.max():.3f})"
+        )
 
 
 class Go2FootStandEnv:
@@ -462,10 +822,17 @@ def build_env(policy_obs_dim: int, robot: Optional[Robot], args):
             max_action_delta=_defaulted(args.max_action_delta, 0.35),
             command_deadband=args.command_deadband,
         )
+    if policy_obs_dim == WalkTheseWaysEnv.obs_dim:
+        return WalkTheseWaysEnv(
+            robot,
+            np.asarray(args.command, dtype=np.float32),
+            joystick_command=args.joystick_command,
+        )
     raise ValueError(
         "Unsupported policy input dimension "
         f"{policy_obs_dim}; supported adapters are Go2FootStand({Go2FootStandEnv.obs_dim}) "
-        f"and Go2JoystickFlat({Go2JoystickFlatEnv.obs_dim})."
+        f"Go2JoystickFlat({Go2JoystickFlatEnv.obs_dim}), "
+        f"and WalkTheseWays({WalkTheseWaysEnv.obs_dim})."
     )
 
 
@@ -487,7 +854,7 @@ def mock_observation() -> RobotObservation:
     )
 
 
-def dry_run(policy: PolicyFn, policy_obs_dim: int, args) -> None:
+def dry_run(policy: PolicyFn, policy_obs_dim: int, args, label: str = "policy") -> None:
     env = build_env(policy_obs_dim, None, args)
     robot_obs = mock_observation()
     for i in range(args.dry_run):
@@ -496,11 +863,11 @@ def dry_run(policy: PolicyFn, policy_obs_dim: int, args) -> None:
         target_rel = env.advance(action, set_act=False)
         if i == 0 or i == args.dry_run - 1:
             print(
-                f"dry_run step={i} obs_shape={obs.shape} "
+                f"{label} dry_run step={i} obs_shape={obs.shape} "
                 f"action_range=({action.min():.4f}, {action.max():.4f}) "
                 f"target_rel_range=({target_rel.min():.4f}, {target_rel.max():.4f})"
             )
-    print("dry_run ok")
+    print(f"{label} dry_run ok")
 
 
 def wait_for_button(env, button: str, message: str) -> None:
@@ -525,6 +892,17 @@ def wait_for_button_repress(env, button: str, message: str) -> None:
         elif saw_release:
             return
         time.sleep(env.dt)
+
+
+def hold_relaxed_until_exit(hold_seconds: float) -> None:
+    hold_seconds = max(float(hold_seconds), 0.0)
+    if hold_seconds == 0.0:
+        print("Robot relaxed; continuing to publish kp=0, kd=0. Press Ctrl+C to stop.")
+        while True:
+            time.sleep(1.0)
+
+    print(f"Robot relaxed; publishing kp=0, kd=0 for {hold_seconds:.1f}s before exit")
+    time.sleep(hold_seconds)
 
 
 def stand_up(robot: Robot, args) -> None:
@@ -583,14 +961,38 @@ def main(args) -> None:
             print(f"  {name}: {path}")
         return
 
-    policy_path = resolve_policy_path(root, args)
-    policy, policy_obs_dim = load_policy(policy_path)
-    print(f"Loaded {policy_path} with obs_dim={policy_obs_dim}, act_dim={ACT_DIM}")
+    velocity_policy_path = _resolve_path(root, args.velocity_policy)
+    footstand_policy_path = resolve_policy_path(root, args)
+    velocity_policy, velocity_obs_dim = load_policy(velocity_policy_path)
+    footstand_policy, footstand_obs_dim = load_policy(footstand_policy_path)
+    supported_velocity_dims = {Go2JoystickFlatEnv.obs_dim, WalkTheseWaysEnv.obs_dim}
+    if velocity_obs_dim not in supported_velocity_dims:
+        raise ValueError(
+            "Velocity policy must use "
+            f"Go2JoystickFlat obs_dim={Go2JoystickFlatEnv.obs_dim} or "
+            f"WalkTheseWays obs_dim={WalkTheseWaysEnv.obs_dim}, "
+            f"got {velocity_obs_dim} from {velocity_policy_path}"
+        )
+    if footstand_obs_dim != Go2FootStandEnv.obs_dim:
+        raise ValueError(
+            f"FootStand policy must use Go2FootStand obs_dim={Go2FootStandEnv.obs_dim}, "
+            f"got {footstand_obs_dim} from {footstand_policy_path}"
+        )
+    print(
+        f"Loaded velocity policy {velocity_policy_path} "
+        f"with obs_dim={velocity_obs_dim}, act_dim={ACT_DIM}"
+    )
+    print(
+        f"Loaded footstand policy {footstand_policy_path} "
+        f"with obs_dim={footstand_obs_dim}, act_dim={ACT_DIM}"
+    )
 
     if args.dry_run:
-        dry_run(policy, policy_obs_dim, args)
+        dry_run(velocity_policy, velocity_obs_dim, args, VELOCITY_STATE)
+        dry_run(footstand_policy, footstand_obs_dim, args, FOOTSTAND_STATE)
         return
 
+    print("Connecting to robot and waiting for lowstate/IMU...", flush=True)
     robot = Robot(
         is_sim=args.sim,
         network_interface=args.eth,
@@ -607,20 +1009,42 @@ def main(args) -> None:
         f"ramp={args.startup_torque_ramp_seconds:.1f}s, "
         f"limits={[round(v, 2) for v in robot.torque_limits_real]}"
     )
-    env = build_env(policy_obs_dim, robot, args)
-    print(f"Using deployment adapter: {env.name}")
+    velocity_env = build_env(velocity_obs_dim, robot, args)
+    footstand_env = build_env(footstand_obs_dim, robot, args)
+    footstand_logger = FootstandJointLogger(
+        _resolve_path(root, args.log_dir),
+        footstand_policy_path,
+    )
+    print(f"Using velocity adapter: {velocity_env.name}")
+    print(f"Using footstand adapter: {footstand_env.name}")
 
     benchmark_times = []
     last_debug = 0.0
     relaxed_before_exit = False
     try:
-        wait_for_button(env, "L1", "Robot initialized, press L1 to stand")
+        wait_for_button(footstand_env, "L1", "Robot initialized, press L1 to stand")
         stand_up(robot, args)
-        env.reset_control_state(robot.get_obs())
+        post_stand_delay = max(float(args.post_stand_delay), 0.0)
+        if post_stand_delay > 0.0:
+            print(
+                f"Stand complete; holding FixStand posture for {post_stand_delay:.1f}s "
+                "before starting velocity policy"
+            )
+            time.sleep(post_stand_delay)
+        robot_obs = robot.get_obs()
+        velocity_env.reset_control_state(robot_obs)
+        footstand_env.reset_control_state(robot_obs)
 
-        wait_for_button(env, "L1", "Robot ready, press L1 to start")
-        print("Robot started, press L2 to stop policy, then press L2 again to relax and exit")
+        print(
+            "Robot started in joystick velocity tracking; release L1, press L1 again "
+            "to switch to FootStand; press L2 to stop policy, then press L2 again "
+            "to relax and exit"
+        )
         robot.to_run()
+        state_machine = PolicyStateMachine()
+        active_state = state_machine.state
+        active_env = velocity_env
+        active_policy = velocity_policy
         policy_start_time = time.perf_counter()
         if not args.disable_torque_limit:
             initial_torque_scale = (
@@ -647,27 +1071,44 @@ def main(args) -> None:
                 )
                 robot.set_torque_limit(True, scale, reset_stats=False)
 
-            obs, robot_obs = env.observe()
-            action = policy(obs)
-            env.advance(action)
+            obs, robot_obs = active_env.observe()
 
             if robot_obs.L2:
+                print("First L2 pressed; setting kp=0, kd=10")
+                robot.to_damp()
                 wait_for_button_repress(
-                    env,
+                    active_env,
                     "L2",
-                    "Policy stopped; release L2, then press L2 again to relax and exit",
+                    "Policy damped; release L2, then press L2 again to enter relax keepalive",
                 )
-                print("Second L2 pressed; setting kp=0, kd=0 before exit")
+                print("Second L2 pressed; setting kp=0, kd=0")
                 robot.to_relax()
-                time.sleep(0.1)
                 relaxed_before_exit = True
+                hold_relaxed_until_exit(args.relax_hold_seconds)
                 break
+
+            previous_state = state_machine.state
+            active_state = state_machine.update(robot_obs)
+            if previous_state == VELOCITY_STATE and active_state == FOOTSTAND_STATE:
+                footstand_env.reset_control_state(robot_obs)
+                active_env = footstand_env
+                active_policy = footstand_policy
+                obs, _ = active_env.observe(robot_obs)
+                print("Switched to FootStand policy")
+                print(f"Logging FootStand joint pos/vel to {footstand_logger.start()}")
+
+            action = active_policy(obs)
+            active_env.advance(action)
+            if active_state == FOOTSTAND_STATE:
+                footstand_logger.log(robot_obs)
 
             if args.debug_command and begin - last_debug >= 0.5:
                 print(
-                    f"{env.debug_summary(obs)} "
+                    f"state={active_state} "
+                    f"{active_env.debug_summary(obs)} "
                     f"action=({action.min():.3f},{action.max():.3f}) "
-                    f"exec=({env.current_actions.min():.3f},{env.current_actions.max():.3f}) "
+                    f"exec=({active_env.current_actions.min():.3f},"
+                    f"{active_env.current_actions.max():.3f}) "
                     f"tau_scale={robot.torque_limit_scale:.2f} "
                     f"tau_max={robot.max_estimated_tau:.2f} "
                     f"tau_hits={robot.torque_limit_hits}"
@@ -680,14 +1121,15 @@ def main(args) -> None:
                 print(f"observe + infer + advance: {elapsed:.6f}s")
 
             elapsed = time.perf_counter() - begin
-            if elapsed < env.dt:
-                time.sleep(env.dt - elapsed)
+            if elapsed < active_env.dt:
+                time.sleep(active_env.dt - elapsed)
     finally:
         if not relaxed_before_exit:
             robot.to_damp()
             time.sleep(1.0)
             robot.to_relax()
             time.sleep(0.1)
+        footstand_logger.close()
         robot.stop()
 
     if benchmark_times:
@@ -705,6 +1147,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--policy-root", type=Path, default=DEFAULT_POLICY_ROOT)
     parser.add_argument("--policy-ckpt", type=str, default=DEFAULT_POLICY_CKPT)
+    parser.add_argument("--velocity-policy", type=Path, default=DEFAULT_VELOCITY_POLICY_PATH)
+    parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
     parser.add_argument("--list-policy-ckpts", action="store_true")
     parser.add_argument("--command", nargs=3, type=float, default=[0.5, 0.0, 0.0])
     parser.add_argument("--joystick-command", dest="joystick_command", action="store_true")
@@ -720,6 +1164,8 @@ if __name__ == "__main__":
     parser.add_argument("--stand-kp", nargs="+", type=float, default=stand_kp_real)
     parser.add_argument("--stand-kd", nargs="+", type=float, default=stand_kd_real)
     parser.add_argument("--stand-seconds", type=float, default=2.0)
+    parser.add_argument("--post-stand-delay", type=float, default=DEFAULT_POST_STAND_DELAY)
+    parser.add_argument("--relax-hold-seconds", type=float, default=DEFAULT_RELAX_HOLD_SECONDS)
     parser.add_argument(
         "--stand-recover-target",
         nargs=ACT_DIM,

@@ -17,6 +17,7 @@ models/
 ckpt/
 record/
 debug/
+logs/
 *.onnx
 *.pt
 *.jit
