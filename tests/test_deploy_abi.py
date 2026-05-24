@@ -64,6 +64,11 @@ def _args(**overrides):
         "policy_root": deploy.DEFAULT_POLICY_ROOT,
         "policy_ckpt": deploy.DEFAULT_POLICY_CKPT,
         "velocity_policy": deploy.DEFAULT_VELOCITY_POLICY_PATH,
+        "pre_footstand_hold_seconds": deploy.DEFAULT_PRE_FOOTSTAND_HOLD_SECONDS,
+        "pre_footstand_pose_seconds": deploy.DEFAULT_PRE_FOOTSTAND_POSE_SECONDS,
+        "pre_footstand_pose_timeout": deploy.DEFAULT_PRE_FOOTSTAND_POSE_TIMEOUT,
+        "pre_footstand_pose_tolerance": deploy.DEFAULT_PRE_FOOTSTAND_POSE_TOLERANCE,
+        "pre_footstand_dq_tolerance": deploy.DEFAULT_PRE_FOOTSTAND_DQ_TOLERANCE,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -84,9 +89,13 @@ class _ButtonSequenceEnv:
 
 class Go2FootStandAbiTest(unittest.TestCase):
     def test_footstand_dimensions_and_joint_order_match_unilab_contract(self) -> None:
-        self.assertEqual(deploy.FOOTSTAND_FRAME_OBS_DIM, 45)
+        self.assertEqual(deploy.FOOTSTAND_TEACHER_FRAME_OBS_DIM, 45)
+        self.assertEqual(deploy.FOOTSTAND_FRAME_OBS_DIM, 42)
+        self.assertEqual(deploy.FOOTSTAND_LEGACY_FRAME_OBS_DIM, 45)
         self.assertEqual(deploy.FOOTSTAND_HISTORY_LEN, 15)
-        self.assertEqual(deploy.Go2FootStandEnv.obs_dim, 675)
+        self.assertEqual(deploy.Go2FootStandEnv.obs_dim, 630)
+        self.assertEqual(deploy.Go2FootStandEnv.legacy_obs_dim, 675)
+        self.assertEqual(deploy.FOOTSTAND_ACTION_SCALE, 0.25)
         np.testing.assert_array_equal(
             deploy.DOF_TO_CTRL,
             np.array([3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8], dtype=np.int32),
@@ -204,6 +213,8 @@ class Go2FootStandAbiTest(unittest.TestCase):
         env = deploy.build_env(deploy.Go2FootStandEnv.obs_dim, None, _args())
 
         self.assertIsInstance(env, deploy.Go2FootStandEnv)
+        self.assertFalse(env.include_linvel)
+        self.assertTrue(env.simulate_action_latency)
         self.assertEqual(env.action_filter_alpha, 1.0)
         self.assertEqual(env.max_action_delta, 0.0)
 
@@ -212,12 +223,30 @@ class Go2FootStandAbiTest(unittest.TestCase):
         env.advance(action, set_act=False)
         np.testing.assert_allclose(env.current_actions, action)
 
+    def test_build_env_still_supports_legacy_footstand_linvel_abi(self) -> None:
+        env = deploy.build_env(deploy.Go2FootStandEnv.legacy_obs_dim, None, _args())
+
+        self.assertIsInstance(env, deploy.Go2FootStandEnv)
+        self.assertTrue(env.include_linvel)
+        self.assertEqual(env.obs_dim, 675)
+        self.assertEqual(env.frame_obs_dim, 45)
+
     def test_walk_these_ways_dimensions_match_legacy_deploy_contract(self) -> None:
         self.assertEqual(deploy.WTW_FRAME_OBS_DIM, 70)
         self.assertEqual(deploy.WTW_HISTORY_LEN, 30)
         self.assertEqual(deploy.WTW_COMMAND_DIM, 15)
         self.assertEqual(deploy.WalkTheseWaysEnv.obs_dim, 2100)
         self.assertEqual(deploy.WTW_BASE_COMMAND.shape, (deploy.WTW_COMMAND_DIM,))
+        self.assertEqual(deploy.WTW_GAIT_FREQUENCY, 3.0)
+        self.assertEqual(deploy.WTW_GAIT_PHASE, 0.5)
+        self.assertEqual(deploy.WTW_GAIT_OFFSET, 0.0)
+        self.assertEqual(deploy.WTW_GAIT_BOUND, 0.0)
+        self.assertEqual(deploy.WTW_GAIT_DURATION, 0.5)
+        self.assertAlmostEqual(deploy.WTW_FOOT_SWING_HEIGHT, 0.08 * 0.15)
+        np.testing.assert_allclose(
+            deploy.WTW_BASE_COMMAND[4:10],
+            [3.0, 0.5, 0.0, 0.0, 0.5, 0.08 * 0.15],
+        )
 
         env = deploy.build_env(deploy.WalkTheseWaysEnv.obs_dim, None, _args())
         self.assertIsInstance(env, deploy.WalkTheseWaysEnv)
@@ -291,8 +320,35 @@ class Go2FootStandAbiTest(unittest.TestCase):
         np.testing.assert_allclose(frame[42:54], expected_clipped)
         np.testing.assert_allclose(frame[54:66], 0.0)
 
-    def test_footstand_observation_frame_layout_and_reset_history(self) -> None:
+    def test_footstand_distilled_observation_frame_layout_and_reset_history(self) -> None:
         env = deploy.Go2FootStandEnv(None)
+        joint_position = np.linspace(-0.06, 0.06, deploy.ACT_DIM, dtype=np.float32)
+        joint_velocity = np.linspace(0.1, 1.2, deploy.ACT_DIM, dtype=np.float32)
+        gyroscope = np.array([0.4, -0.5, 0.6], dtype=np.float32)
+
+        obs, _ = env.observe(
+            _robot_obs(
+                joint_position=joint_position,
+                joint_velocity=joint_velocity,
+                gyroscope=gyroscope,
+            )
+        )
+
+        expected_frame = np.concatenate(
+            [
+                gyroscope,
+                np.array([0.0, 0.0, -1.0], dtype=np.float32),
+                joint_position,
+                joint_velocity,
+                np.zeros(deploy.ACT_DIM, dtype=np.float32),
+            ],
+            dtype=np.float32,
+        )
+        frames = obs.reshape(deploy.FOOTSTAND_HISTORY_LEN, deploy.FOOTSTAND_FRAME_OBS_DIM)
+        np.testing.assert_allclose(frames, np.broadcast_to(expected_frame, frames.shape))
+
+    def test_legacy_footstand_observation_frame_keeps_zero_linvel_slot(self) -> None:
+        env = deploy.Go2FootStandEnv(None, include_linvel=True)
         joint_position = np.linspace(-0.06, 0.06, deploy.ACT_DIM, dtype=np.float32)
         joint_velocity = np.linspace(0.1, 1.2, deploy.ACT_DIM, dtype=np.float32)
         gyroscope = np.array([0.4, -0.5, 0.6], dtype=np.float32)
@@ -316,7 +372,9 @@ class Go2FootStandAbiTest(unittest.TestCase):
             ],
             dtype=np.float32,
         )
-        frames = obs.reshape(deploy.FOOTSTAND_HISTORY_LEN, deploy.FOOTSTAND_FRAME_OBS_DIM)
+        frames = obs.reshape(
+            deploy.FOOTSTAND_HISTORY_LEN, deploy.FOOTSTAND_LEGACY_FRAME_OBS_DIM
+        )
         np.testing.assert_allclose(frames, np.broadcast_to(expected_frame, frames.shape))
 
     def test_footstand_last_actions_lag_matches_unilab_apply_action(self) -> None:
@@ -343,7 +401,7 @@ class Go2FootStandAbiTest(unittest.TestCase):
         )
         np.testing.assert_allclose(frames[-1, -deploy.ACT_DIM :], first_action)
 
-    def test_footstand_actions_integrate_real_order_motor_targets(self) -> None:
+    def test_footstand_actions_integrate_with_training_action_latency(self) -> None:
         env = deploy.Go2FootStandEnv(None)
         joint_position = np.linspace(-0.03, 0.03, deploy.ACT_DIM, dtype=np.float32)
         robot_obs = _robot_obs(joint_position=joint_position)
@@ -362,14 +420,119 @@ class Go2FootStandAbiTest(unittest.TestCase):
         )
         target_rel = env.advance(raw_action, set_act=False)
         exec_action = np.clip(raw_action, -1.0, 1.0)
+        np.testing.assert_allclose(env.current_actions, exec_action)
+        np.testing.assert_allclose(target_rel, start_abs - deploy.Q0_REAL)
+
+        target_rel = env.advance(np.zeros(deploy.ACT_DIM, dtype=np.float32), set_act=False)
         expected_abs = np.clip(
             start_abs + exec_action * deploy.FOOTSTAND_ACTION_SCALE,
             deploy.REAL_POSITION_LOW,
             deploy.REAL_POSITION_HIGH,
         )
 
-        np.testing.assert_allclose(env.current_actions, exec_action)
+        np.testing.assert_allclose(env.last_actions, exec_action)
+        np.testing.assert_allclose(env.current_actions, 0.0)
         np.testing.assert_allclose(target_rel, expected_abs - deploy.Q0_REAL)
+
+    def test_hold_zero_velocity_command_overrides_and_restores_command(self) -> None:
+        class HoldEnv:
+            dt = 0.01
+
+            def __init__(self) -> None:
+                self.command = np.asarray([0.5, 0.1, -0.2], dtype=np.float32)
+                self.joystick_command = True
+                self.commands_seen: list[np.ndarray] = []
+                self.advance_count = 0
+
+            def observe(self):
+                self.commands_seen.append(self.command.copy())
+                return np.zeros(deploy.Go2JoystickFlatEnv.obs_dim, dtype=np.float32), _robot_obs()
+
+            def advance(self, action):
+                self.advance_count += 1
+                return np.asarray(action, dtype=np.float32)
+
+        env = HoldEnv()
+
+        robot_obs = deploy.hold_zero_velocity_command(
+            env,
+            lambda obs: np.ones(deploy.ACT_DIM, dtype=np.float32),
+            0.001,
+        )
+
+        self.assertIsInstance(robot_obs, RobotObservation)
+        self.assertGreaterEqual(env.advance_count, 1)
+        np.testing.assert_allclose(env.commands_seen[0], 0.0)
+        np.testing.assert_allclose(env.command, [0.5, 0.1, -0.2])
+        self.assertTrue(env.joystick_command)
+
+    def test_move_to_footstand_start_pose_commands_q0_and_confirms(self) -> None:
+        class PoseRobot:
+            def __init__(self) -> None:
+                self.kp = 35.0
+                self.kd = 0.5
+                self.stand_kp = deploy.STAND_KP_REAL.tolist()
+                self.stand_kd = deploy.STAND_KD_REAL.tolist()
+                self.target_rel_real = _robot_obs(
+                    joint_position=np.asarray(
+                        [0.1, -0.2, 0.3, -0.1, 0.2, -0.3, 0.05, -0.05, 0.1, -0.05, 0.05, -0.1],
+                        dtype=np.float32,
+                    )
+                )
+                self.commands: list[np.ndarray] = []
+                self.observe_count = 0
+
+            def get_obs(self):
+                self.observe_count += 1
+                if self.observe_count < 3:
+                    return self.target_rel_real
+                return _robot_obs()
+
+            def set_act_real(self, action):
+                self.commands.append(np.asarray(action, dtype=np.float32))
+
+        robot = PoseRobot()
+
+        obs = deploy.move_to_footstand_start_pose(
+            robot,
+            move_seconds=0.0,
+            timeout_seconds=0.1,
+            q_tolerance=0.01,
+            dq_tolerance=0.01,
+        )
+
+        self.assertIsInstance(obs, RobotObservation)
+        self.assertGreaterEqual(len(robot.commands), 1)
+        np.testing.assert_allclose(robot.commands[-1], 0.0)
+        self.assertEqual(robot.kp, 35.0)
+        self.assertEqual(robot.kd, 0.5)
+
+    def test_move_to_footstand_start_pose_raises_if_not_confirmed(self) -> None:
+        class StuckRobot:
+            def __init__(self) -> None:
+                self.kp = 35.0
+                self.kd = 0.5
+                self.stand_kp = deploy.STAND_KP_REAL.tolist()
+                self.stand_kd = deploy.STAND_KD_REAL.tolist()
+                self.commands: list[np.ndarray] = []
+
+            def get_obs(self):
+                return _robot_obs(
+                    joint_position=np.full(deploy.ACT_DIM, 0.2, dtype=np.float32),
+                    joint_velocity=np.full(deploy.ACT_DIM, 2.0, dtype=np.float32),
+                )
+
+            def set_act_real(self, action):
+                self.commands.append(np.asarray(action, dtype=np.float32))
+
+        with self.assertRaises(RuntimeError):
+            deploy.move_to_footstand_start_pose(
+                StuckRobot(),
+                move_seconds=0.0,
+                timeout_seconds=0.0,
+                q_tolerance=0.01,
+                dq_tolerance=0.01,
+            )
 
     def test_default_footstand_onnx_has_expected_abi_shape(self) -> None:
         args = _args(policy_root=deploy.DEFAULT_POLICY_ROOT, policy_ckpt=deploy.DEFAULT_POLICY_CKPT)

@@ -22,7 +22,7 @@ Policy files are expected under `models/<TaskName>/policy.onnx` or checkpoint
 subdirectories such as `models/Go2FootStand/<CheckpointName>/policy.onnx`, for example:
 
 - `models/Go2FootStand/policy.onnx`
-- `models/Go2FootStand/2026-05-21_14-16-56_mujoco/policy.onnx`
+- `models/Go2FootStand/2026-05-22_06-14-41_mujoco/policy.onnx`
 - `models/Go2JoystickFlat/policy.onnx`
 - `models/walk_these_ways/body_latest.jit`
 - `models/walk_these_ways/adaptation_module_latest.jit`
@@ -43,14 +43,14 @@ You can list or select checkpoints with:
 
 ```bash
 ./run.sh python deploy.py --list-policy-ckpts
-./run.sh python deploy.py --policy-ckpt 2026-05-21_14-16-56_mujoco
+./run.sh python deploy.py --policy-ckpt 2026-05-22_06-14-41_mujoco
 ./run.sh python deploy.py --policy-ckpt latest
 ```
 
 The direct path form is still supported and overrides `--policy-ckpt`:
 
 ```bash
-./run.sh python deploy.py --policy models/Go2FootStand/2026-05-21_14-16-56_mujoco/policy.onnx
+./run.sh python deploy.py --policy models/Go2FootStand/2026-05-22_06-14-41_mujoco/policy.onnx
 ```
 
 The runtime state machine loads both policies:
@@ -58,7 +58,9 @@ The runtime state machine loads both policies:
 - after the first L1 stand-up, it starts `models/walk_these_ways` for joystick velocity tracking.
 - after stand-up finishes, it holds the final FixStand posture for 2 seconds before handing control to the velocity policy; tune this with `--post-stand-delay`.
 - after L1 is released, press L1 again to switch once into the selected Go2FootStand checkpoint.
-- `--velocity-policy` can override the joystick policy path; use `models/Go2JoystickFlat/policy.onnx` here if you want the older ONNX joystick policy.
+- before switching to FootStand, it runs the velocity policy with a zero command for 0.75 seconds; tune this with `--pre-footstand-hold-seconds`.
+- then it interpolates the joints to the UniLab Go2FootStand reset pose (`Q0`) and only starts FootStand after measured joint error and velocity are within tolerance.
+- `--velocity-policy` can override the joystick policy path; use `models/Go2JoystickFlat/policy.onnx` here if you want the ONNX joystick policy.
 - `--policy` or `--policy-ckpt` selects the FootStand policy.
 - after switching to FootStand, joint absolute position and velocity are logged to `logs/footstand_<ckpt>_<YYYYmmdd_HHMMSS_BJT>.csv`; use `--log-dir` to change the output directory.
 
@@ -70,12 +72,12 @@ The default `walk_these_ways` velocity adapter matches the legacy TorchScript AB
 
 The deployment adapter matches the UniLab `Go2FootStand` actor ABI:
 
-- 45 values per frame: local linear velocity, gyro, local gravity, joint position delta, joint velocity, previous action.
-- 15-frame observation history, flattened to 675 values.
-- 12 actions in Unitree real/control order, clipped to `[-1, 1]`, integrated into motor targets with `action_scale=0.3`.
+- Current distilled FootStand checkpoints consume 42 values per frame: gyro, local gravity, joint position delta, joint velocity, previous action.
+- The 15-frame observation history is flattened to 630 values for the distilled actor, matching `2026-05-22_06-14-41_mujoco`.
+- Legacy 675-value FootStand checkpoints are still supported by selecting the 45-value frame adapter, which keeps a zero-filled local linear velocity slot.
+- 12 actions in Unitree real/control order, clipped to `[-1, 1]`, integrated into motor targets with `action_scale=0.25`.
+- FootStand actions are applied with a one-control-step delay, matching `simulate_action_latency=true` in the training config.
 - By default FootStand actions are not filtered or delta-limited, matching UniLab `Go2FootStandTask.apply_action()`.
-
-The Go2 low-state stream does not provide base linear velocity, so deployment fills that 3-value ABI slot with zeros.
 
 The first L1 stand-up phase follows the Unitree/mjlab Go2 `FixStand` trajectory:
 
@@ -92,6 +94,8 @@ Useful options:
 ./run.sh python deploy.py --torque-limit-scale 0.65 --startup-torque-limit-scale 0.45 --debug-command
 ./run.sh python deploy.py --stand-seconds 2
 ./run.sh python deploy.py --post-stand-delay 2.0
+./run.sh python deploy.py --pre-footstand-hold-seconds 0.75
+./run.sh python deploy.py --pre-footstand-pose-seconds 1.0 --pre-footstand-pose-tolerance 0.16 --pre-footstand-dq-tolerance 1.0
 ./run.sh python deploy.py --relax-hold-seconds 5.0
 ./run.sh python deploy.py --action-filter-alpha 0.35 --max-action-delta 0.2
 ```
@@ -103,16 +107,15 @@ If the robot still overloads, lower `--torque-limit-scale`; if it cannot rise bu
 
 ## Go2JoystickFlat
 
-Use the older joystick policy as the velocity-tracking stage:
+Use Go2JoystickFlat as the optional ONNX velocity-tracking stage:
 
 ```bash
-./run.sh python deploy.py --velocity-policy models/Go2JoystickFlat/policy.onnx
+./run.sh python deploy.py --velocity-policy models/Go2JoystickFlat/policy.onnx --debug-command
 ```
 
 Useful options:
 
 ```bash
-./run.sh python deploy.py --velocity-policy models/Go2JoystickFlat/policy.onnx --debug-command
 ./run.sh python deploy.py --velocity-policy models/Go2JoystickFlat/policy.onnx --dry-run 8
 ./run.sh python deploy.py --velocity-policy models/Go2JoystickFlat/policy.onnx --fixed-command --command 0.5 0.0 0.0
 ```
@@ -124,6 +127,7 @@ The stand-up phase interpolates from the current joint offsets to the standing p
 - First L1: interpolated stand-up.
 - After stand-up: hold the final stand pose for 2 seconds, then start joystick velocity tracking.
 - Release L1, then press L1 again: switch to FootStand policy.
+- The FootStand switch first holds zero velocity, moves joints to the UniLab reset pose, and aborts instead of running the policy if the pose is not confirmed.
 - First L2 during policy control: stop policy control and set `kp=0,kd=10`.
 - Release L2, then press L2 again: set all `kp/kd` to zero and keep publishing relaxed lowcmds.
 - By default the relaxed lowcmd keepalive runs until Ctrl+C; use `--relax-hold-seconds N` to exit automatically after `N` seconds.

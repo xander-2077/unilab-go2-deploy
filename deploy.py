@@ -33,27 +33,32 @@ from utils.math_utils import project_gravity
 
 
 JOYSTICK_OBS_DIM = 49
-FOOTSTAND_FRAME_OBS_DIM = 45
+FOOTSTAND_LINVEL_DIM = 3
+FOOTSTAND_TEACHER_FRAME_OBS_DIM = 45
+FOOTSTAND_FRAME_OBS_DIM = FOOTSTAND_TEACHER_FRAME_OBS_DIM - FOOTSTAND_LINVEL_DIM
+FOOTSTAND_LEGACY_FRAME_OBS_DIM = FOOTSTAND_TEACHER_FRAME_OBS_DIM
 FOOTSTAND_HISTORY_LEN = 15
 FOOTSTAND_OBS_DIM = FOOTSTAND_FRAME_OBS_DIM * FOOTSTAND_HISTORY_LEN
+FOOTSTAND_LEGACY_OBS_DIM = FOOTSTAND_LEGACY_FRAME_OBS_DIM * FOOTSTAND_HISTORY_LEN
 ACT_DIM = 12
 CTRL_DT = 0.02
 GAIT_FREQUENCY = 2.0
 JOYSTICK_ACTION_SCALE = 0.25
-FOOTSTAND_ACTION_SCALE = 0.3
+FOOTSTAND_ACTION_SCALE = 0.25
 WTW_FRAME_OBS_DIM = 70
 WTW_HISTORY_LEN = 30
 WTW_OBS_DIM = WTW_FRAME_OBS_DIM * WTW_HISTORY_LEN
 WTW_COMMAND_DIM = 15
 WTW_ACTION_SCALE = 0.25
-# Conservative low-frequency trot preset. Keep these command values and the
-# deployment gait clock in sync so the policy command and phase observation agree.
-WTW_GAIT_FREQUENCY = 2.0
+# Legacy trot preset from backup/deployment-backup-0512/backup_20260511_004620.
+# Keep these command values and the deployment gait clock in sync so the policy
+# command and phase observation agree.
+WTW_GAIT_FREQUENCY = 3.0
 WTW_GAIT_PHASE = 0.5
 WTW_GAIT_OFFSET = 0.0
 WTW_GAIT_BOUND = 0.0
 WTW_GAIT_DURATION = 0.5
-WTW_FOOT_SWING_HEIGHT = 0.06 * 0.15
+WTW_FOOT_SWING_HEIGHT = 0.08 * 0.15
 WTW_COMMAND_LOW = np.asarray([-1.0, -0.6, -1.0], dtype=np.float32)
 WTW_COMMAND_HIGH = np.asarray([1.0, 0.6, 1.0], dtype=np.float32)
 WTW_BODY_FILE = "body_latest.jit"
@@ -64,6 +69,11 @@ DEFAULT_POLICY_FILE_NAME = "policy.onnx"
 DEFAULT_POLICY_CKPT = "latest"
 DEFAULT_POLICY_PATH = DEFAULT_POLICY_ROOT / DEFAULT_POLICY_FILE_NAME
 DEFAULT_POST_STAND_DELAY = 2.0
+DEFAULT_PRE_FOOTSTAND_HOLD_SECONDS = 0.75
+DEFAULT_PRE_FOOTSTAND_POSE_SECONDS = 1.0
+DEFAULT_PRE_FOOTSTAND_POSE_TIMEOUT = 2.5
+DEFAULT_PRE_FOOTSTAND_POSE_TOLERANCE = 0.16
+DEFAULT_PRE_FOOTSTAND_DQ_TOLERANCE = 1.0
 DEFAULT_RELAX_HOLD_SECONDS = 0.0
 VELOCITY_STATE = "velocity"
 FOOTSTAND_STATE = "footstand"
@@ -670,6 +680,8 @@ class Go2FootStandEnv:
     name = "Go2FootStand"
     obs_dim = FOOTSTAND_OBS_DIM
     frame_obs_dim = FOOTSTAND_FRAME_OBS_DIM
+    legacy_obs_dim = FOOTSTAND_LEGACY_OBS_DIM
+    legacy_frame_obs_dim = FOOTSTAND_LEGACY_FRAME_OBS_DIM
     history_len = FOOTSTAND_HISTORY_LEN
     act_dim = ACT_DIM
     dt = CTRL_DT
@@ -680,8 +692,17 @@ class Go2FootStandEnv:
         robot: Optional[Robot],
         action_filter_alpha: float = 1.0,
         max_action_delta: float = 0.0,
+        include_linvel: bool = False,
+        simulate_action_latency: bool = True,
     ):
         self.robot = robot
+        self.include_linvel = bool(include_linvel)
+        self.simulate_action_latency = bool(simulate_action_latency)
+        self.name = "Go2FootStandLegacyLinvel" if self.include_linvel else "Go2FootStand"
+        self.frame_obs_dim = (
+            self.legacy_frame_obs_dim if self.include_linvel else FOOTSTAND_FRAME_OBS_DIM
+        )
+        self.obs_dim = self.frame_obs_dim * self.history_len
         self.action_filter_alpha = float(np.clip(action_filter_alpha, 0.0, 1.0))
         self.max_action_delta = float(max_action_delta)
         self.current_actions = np.zeros(ACT_DIM, dtype=np.float32)
@@ -734,17 +755,22 @@ class Go2FootStandEnv:
         )
 
     def make_obs(self, robot_obs: RobotObservation) -> np.ndarray:
-        # Unitree lowstate does not expose base linear velocity. FootStand is quasi-static,
-        # so deployment fills the ABI slot with zero local linear velocity.
+        # The current distilled UniLab actor drops local linear velocity per frame.
+        # Legacy 675-dim FootStand checkpoints still expect the original slot.
         linvel = np.zeros(3, dtype=np.float32)
         gyro = np.asarray(robot_obs.gyroscope, dtype=np.float32).reshape(3)
         gravity_down = _project_gravity_down(robot_obs.quaternion)
         dof_diff = np.asarray(robot_obs.joint_position, dtype=np.float32).reshape(ACT_DIM)
         dof_vel = np.asarray(robot_obs.joint_velocity, dtype=np.float32).reshape(ACT_DIM)
 
-        frame_obs = np.concatenate(
+        teacher_frame_obs = np.concatenate(
             [linvel, gyro, gravity_down, dof_diff, dof_vel, self.last_actions],
             dtype=np.float32,
+        )
+        frame_obs = (
+            teacher_frame_obs
+            if self.include_linvel
+            else teacher_frame_obs[FOOTSTAND_LINVEL_DIM:]
         )
         if frame_obs.shape != (self.frame_obs_dim,):
             raise ValueError(
@@ -773,17 +799,18 @@ class Go2FootStandEnv:
             raise ValueError(f"Policy produced non-finite action: {raw_action}")
 
         raw_action = np.clip(raw_action, -1.0, 1.0).astype(np.float32)
-        exec_action = _filter_action(
+        current_action = _filter_action(
             raw_action,
             self.filtered_actions,
             self.action_filter_alpha,
             self.max_action_delta,
         )
-        exec_action = np.clip(exec_action, -1.0, 1.0).astype(np.float32)
+        current_action = np.clip(current_action, -1.0, 1.0).astype(np.float32)
+        exec_action = self.current_actions.copy() if self.simulate_action_latency else current_action
 
         self.last_actions = self.current_actions.copy()
-        self.current_actions = exec_action
-        self.filtered_actions = exec_action
+        self.current_actions = current_action
+        self.filtered_actions = current_action
         self.motor_targets_abs = np.clip(
             self.motor_targets_abs + exec_action * self.action_scale,
             REAL_POSITION_LOW,
@@ -799,9 +826,15 @@ class Go2FootStandEnv:
     def debug_summary(self, obs: np.ndarray) -> str:
         del obs
         frame = self.last_frame_obs
+        if self.include_linvel:
+            return (
+                f"linvel={frame[0:3].round(3).tolist()} "
+                f"gravity={frame[6:9].round(3).tolist()} "
+                f"target=({self.motor_targets_abs.min():.3f},{self.motor_targets_abs.max():.3f})"
+            )
         return (
-            f"linvel={frame[0:3].round(3).tolist()} "
-            f"gravity={frame[6:9].round(3).tolist()} "
+            f"gyro={frame[0:3].round(3).tolist()} "
+            f"gravity={frame[3:6].round(3).tolist()} "
             f"target=({self.motor_targets_abs.min():.3f},{self.motor_targets_abs.max():.3f})"
         )
 
@@ -812,6 +845,13 @@ def build_env(policy_obs_dim: int, robot: Optional[Robot], args):
             robot,
             action_filter_alpha=_defaulted(args.action_filter_alpha, 1.0),
             max_action_delta=_defaulted(args.max_action_delta, 0.0),
+        )
+    if policy_obs_dim == Go2FootStandEnv.legacy_obs_dim:
+        return Go2FootStandEnv(
+            robot,
+            action_filter_alpha=_defaulted(args.action_filter_alpha, 1.0),
+            max_action_delta=_defaulted(args.max_action_delta, 0.0),
+            include_linvel=True,
         )
     if policy_obs_dim == Go2JoystickFlatEnv.obs_dim:
         return Go2JoystickFlatEnv(
@@ -831,6 +871,7 @@ def build_env(policy_obs_dim: int, robot: Optional[Robot], args):
     raise ValueError(
         "Unsupported policy input dimension "
         f"{policy_obs_dim}; supported adapters are Go2FootStand({Go2FootStandEnv.obs_dim}) "
+        f"Go2FootStandLegacyLinvel({Go2FootStandEnv.legacy_obs_dim}), "
         f"Go2JoystickFlat({Go2JoystickFlatEnv.obs_dim}), "
         f"and WalkTheseWays({WalkTheseWaysEnv.obs_dim})."
     )
@@ -892,6 +933,128 @@ def wait_for_button_repress(env, button: str, message: str) -> None:
         elif saw_release:
             return
         time.sleep(env.dt)
+
+
+def hold_zero_velocity_command(env, policy: PolicyFn, hold_seconds: float) -> RobotObservation:
+    hold_seconds = max(float(hold_seconds), 0.0)
+    if hold_seconds == 0.0:
+        _, robot_obs = env.observe()
+        return robot_obs
+
+    previous_joystick_command = getattr(env, "joystick_command", None)
+    previous_command = getattr(env, "command", None)
+    if previous_joystick_command is not None:
+        env.joystick_command = False
+    if previous_command is not None:
+        env.command = np.zeros_like(np.asarray(previous_command, dtype=np.float32))
+
+    print(f"Holding zero velocity command for {hold_seconds:.2f}s before FootStand")
+    latest_robot_obs: RobotObservation | None = None
+    deadline = time.perf_counter() + hold_seconds
+    try:
+        while True:
+            begin = time.perf_counter()
+            if begin >= deadline:
+                break
+            obs, latest_robot_obs = env.observe()
+            action = policy(obs)
+            env.advance(action)
+            elapsed = time.perf_counter() - begin
+            if elapsed < env.dt:
+                time.sleep(min(env.dt - elapsed, max(deadline - time.perf_counter(), 0.0)))
+    finally:
+        if previous_joystick_command is not None:
+            env.joystick_command = previous_joystick_command
+        if previous_command is not None:
+            env.command = previous_command
+
+    if latest_robot_obs is None:
+        _, latest_robot_obs = env.observe()
+    return latest_robot_obs
+
+
+def move_to_footstand_start_pose(
+    robot: Robot,
+    *,
+    move_seconds: float,
+    timeout_seconds: float,
+    q_tolerance: float,
+    dq_tolerance: float,
+) -> RobotObservation:
+    """Move to UniLab Go2FootStand reset joint pose and confirm measured state."""
+    move_seconds = max(float(move_seconds), 0.0)
+    timeout_seconds = max(float(timeout_seconds), move_seconds)
+    q_tolerance = max(float(q_tolerance), 0.0)
+    dq_tolerance = max(float(dq_tolerance), 0.0)
+
+    start_obs = robot.get_obs()
+    start_rel_real = _dof_to_ctrl_order(
+        np.asarray(start_obs.joint_position, dtype=np.float32)
+    )
+    target_rel_real = np.zeros(ACT_DIM, dtype=np.float32)
+    previous_kp = robot.kp
+    previous_kd = robot.kd
+
+    print(
+        "Moving to UniLab Go2FootStand start pose "
+        f"for {move_seconds:.2f}s, then confirming "
+        f"q_err<={q_tolerance:.3f}rad and |dq|<={dq_tolerance:.3f}rad/s"
+    )
+    print("Using stand gains for FootStand start-pose alignment")
+
+    begin = time.perf_counter()
+    best_q_err = np.inf
+    best_dq = np.inf
+    latest_obs = start_obs
+    latest_q_rel = np.asarray(start_obs.joint_position, dtype=np.float32).reshape(ACT_DIM)
+    latest_dq = np.asarray(start_obs.joint_velocity, dtype=np.float32).reshape(ACT_DIM)
+    try:
+        robot.kp = robot.stand_kp
+        robot.kd = robot.stand_kd
+        while True:
+            now = time.perf_counter()
+            alpha = 1.0 if move_seconds == 0.0 else min((now - begin) / move_seconds, 1.0)
+            smooth = alpha * alpha * (3.0 - 2.0 * alpha)
+            target = (1.0 - smooth) * start_rel_real + smooth * target_rel_real
+            robot.set_act_real(target.tolist())
+            if alpha >= 1.0:
+                break
+            time.sleep(CTRL_DT)
+
+        robot.set_act_real(target_rel_real.tolist())
+        deadline = begin + timeout_seconds
+        while time.perf_counter() <= deadline:
+            latest_obs = robot.get_obs()
+            latest_q_rel = np.asarray(latest_obs.joint_position, dtype=np.float32).reshape(ACT_DIM)
+            latest_dq = np.asarray(latest_obs.joint_velocity, dtype=np.float32).reshape(ACT_DIM)
+            q_err = float(np.max(np.abs(latest_q_rel)))
+            dq_abs = float(np.max(np.abs(latest_dq)))
+            best_q_err = min(best_q_err, q_err)
+            best_dq = min(best_dq, dq_abs)
+            if q_err <= q_tolerance and dq_abs <= dq_tolerance:
+                print(
+                    "FootStand start pose confirmed: "
+                    f"q_err={q_err:.3f}rad max_dq={dq_abs:.3f}rad/s"
+                )
+                return latest_obs
+            robot.set_act_real(target_rel_real.tolist())
+            time.sleep(CTRL_DT)
+    finally:
+        robot.kp = previous_kp
+        robot.kd = previous_kd
+
+    worst_q_idx = int(np.argmax(np.abs(latest_q_rel)))
+    worst_dq_idx = int(np.argmax(np.abs(latest_dq)))
+    worst_q_name = sim_index_to_name[worst_q_idx]
+    worst_dq_name = sim_index_to_name[worst_dq_idx]
+    raise RuntimeError(
+        "FootStand start pose was not reached before timeout: "
+        f"best_q_err={best_q_err:.3f}rad best_max_dq={best_dq:.3f}rad/s; "
+        f"latest_worst_q={worst_q_name} rel={latest_q_rel[worst_q_idx]:.3f}rad "
+        f"abs={(latest_q_rel[worst_q_idx] + Q0_SIM[worst_q_idx]):.3f}rad "
+        f"target={Q0_SIM[worst_q_idx]:.3f}rad; "
+        f"latest_worst_dq={worst_dq_name} dq={latest_dq[worst_dq_idx]:.3f}rad/s"
+    )
 
 
 def hold_relaxed_until_exit(hold_seconds: float) -> None:
@@ -973,9 +1136,12 @@ def main(args) -> None:
             f"WalkTheseWays obs_dim={WalkTheseWaysEnv.obs_dim}, "
             f"got {velocity_obs_dim} from {velocity_policy_path}"
         )
-    if footstand_obs_dim != Go2FootStandEnv.obs_dim:
+    supported_footstand_dims = {Go2FootStandEnv.obs_dim, Go2FootStandEnv.legacy_obs_dim}
+    if footstand_obs_dim not in supported_footstand_dims:
         raise ValueError(
-            f"FootStand policy must use Go2FootStand obs_dim={Go2FootStandEnv.obs_dim}, "
+            "FootStand policy must use "
+            f"Go2FootStand obs_dim={Go2FootStandEnv.obs_dim} or "
+            f"Go2FootStandLegacyLinvel obs_dim={Go2FootStandEnv.legacy_obs_dim}, "
             f"got {footstand_obs_dim} from {footstand_policy_path}"
         )
     print(
@@ -1090,6 +1256,18 @@ def main(args) -> None:
             previous_state = state_machine.state
             active_state = state_machine.update(robot_obs)
             if previous_state == VELOCITY_STATE and active_state == FOOTSTAND_STATE:
+                robot_obs = hold_zero_velocity_command(
+                    velocity_env,
+                    velocity_policy,
+                    args.pre_footstand_hold_seconds,
+                )
+                robot_obs = move_to_footstand_start_pose(
+                    robot,
+                    move_seconds=args.pre_footstand_pose_seconds,
+                    timeout_seconds=args.pre_footstand_pose_timeout,
+                    q_tolerance=args.pre_footstand_pose_tolerance,
+                    dq_tolerance=args.pre_footstand_dq_tolerance,
+                )
                 footstand_env.reset_control_state(robot_obs)
                 active_env = footstand_env
                 active_policy = footstand_policy
@@ -1165,6 +1343,36 @@ if __name__ == "__main__":
     parser.add_argument("--stand-kd", nargs="+", type=float, default=stand_kd_real)
     parser.add_argument("--stand-seconds", type=float, default=2.0)
     parser.add_argument("--post-stand-delay", type=float, default=DEFAULT_POST_STAND_DELAY)
+    parser.add_argument(
+        "--pre-footstand-hold-seconds",
+        type=float,
+        default=DEFAULT_PRE_FOOTSTAND_HOLD_SECONDS,
+        help="Run the velocity policy with a zero command before switching to FootStand.",
+    )
+    parser.add_argument(
+        "--pre-footstand-pose-seconds",
+        type=float,
+        default=DEFAULT_PRE_FOOTSTAND_POSE_SECONDS,
+        help="Interpolate joints to the UniLab Go2FootStand reset pose before policy start.",
+    )
+    parser.add_argument(
+        "--pre-footstand-pose-timeout",
+        type=float,
+        default=DEFAULT_PRE_FOOTSTAND_POSE_TIMEOUT,
+        help="Maximum total seconds allowed for reaching the FootStand reset pose.",
+    )
+    parser.add_argument(
+        "--pre-footstand-pose-tolerance",
+        type=float,
+        default=DEFAULT_PRE_FOOTSTAND_POSE_TOLERANCE,
+        help="Maximum absolute joint-position error in radians before FootStand policy starts.",
+    )
+    parser.add_argument(
+        "--pre-footstand-dq-tolerance",
+        type=float,
+        default=DEFAULT_PRE_FOOTSTAND_DQ_TOLERANCE,
+        help="Maximum absolute joint velocity in rad/s before FootStand policy starts.",
+    )
     parser.add_argument("--relax-hold-seconds", type=float, default=DEFAULT_RELAX_HOLD_SECONDS)
     parser.add_argument(
         "--stand-recover-target",
