@@ -292,6 +292,11 @@ def _dof_to_ctrl_order(values: np.ndarray) -> np.ndarray:
     return np.asarray(values, dtype=np.float32).reshape(ACT_DIM)[DOF_TO_CTRL]
 
 
+FOOTSTAND_START_Q_SIM = Q0_SIM.copy()
+FOOTSTAND_START_Q_REAL = _dof_to_ctrl_order(FOOTSTAND_START_Q_SIM)
+FOOTSTAND_START_REL_REAL = FOOTSTAND_START_Q_REAL - Q0_REAL
+
+
 def _project_gravity_down(quaternion: list[float]) -> np.ndarray:
     gravity_down = np.asarray(project_gravity(quaternion), dtype=np.float32)
     norm = np.linalg.norm(gravity_down)
@@ -354,6 +359,10 @@ class PolicyStateMachine:
         return self.state
 
 
+def _real_order_joint_names() -> list[str]:
+    return [id_to_name[real_index_to_id[i]] for i in range(ACT_DIM)]
+
+
 class FootstandJointLogger:
     def __init__(self, log_dir: Path, policy_path: Path, flush_every: int = 25):
         self.log_dir = log_dir
@@ -364,6 +373,8 @@ class FootstandJointLogger:
         self._writer: csv.writer | None = None
         self._start_perf = 0.0
         self._rows = 0
+        self._start_torque_limit_hits: int | None = None
+        self._last_torque_limit_hits: int | None = None
 
     def start(self) -> Path:
         if self._writer is not None:
@@ -379,27 +390,143 @@ class FootstandJointLogger:
         self._file.flush()
         self._start_perf = time.perf_counter()
         self._rows = 0
+        self._start_torque_limit_hits = None
+        self._last_torque_limit_hits = None
         return self.path
 
     def _header(self) -> list[str]:
-        q_columns = [f"q_abs_{name}" for name in sim_index_to_name]
-        dq_columns = [f"dq_{name}" for name in sim_index_to_name]
-        return ["beijing_time", "elapsed_s", *q_columns, *dq_columns]
+        real_names = _real_order_joint_names()
+        return [
+            "wall_time_iso",
+            "elapsed_s",
+            "step",
+            "obs_norm",
+            "action_min",
+            "action_max",
+            "target_rel_min",
+            "target_rel_max",
+            "gyro_x",
+            "gyro_y",
+            "gyro_z",
+            "quat_w",
+            "quat_x",
+            "quat_y",
+            "quat_z",
+            "roll",
+            "pitch",
+            "yaw",
+            *[f"q_abs_sim_{name}" for name in sim_index_to_name],
+            *[f"q_rel_sim_{name}" for name in sim_index_to_name],
+            *[f"dq_sim_{name}" for name in sim_index_to_name],
+            *[f"action_ctrl_{name}" for name in real_names],
+            *[f"current_action_ctrl_{name}" for name in real_names],
+            *[f"last_action_ctrl_{name}" for name in real_names],
+            *[f"target_abs_real_{name}" for name in real_names],
+            *[f"target_rel_real_{name}" for name in real_names],
+            "torque_limit_enabled",
+            "torque_limit_scale",
+            "torque_limit_hits_total",
+            "torque_limit_hits_since_log_start",
+            "torque_limit_hits_delta",
+            "max_estimated_tau_abs",
+            *[f"requested_q_real_{name}" for name in real_names],
+            *[f"lowcmd_q_real_{name}" for name in real_names],
+            *[f"lowcmd_kp_real_{name}" for name in real_names],
+            *[f"lowcmd_kd_real_{name}" for name in real_names],
+            *[f"estimated_tau_real_{name}" for name in real_names],
+            *[f"torque_limit_real_{name}" for name in real_names],
+            *[f"torque_limit_hit_real_{name}" for name in real_names],
+        ]
 
-    def log(self, robot_obs: RobotObservation) -> None:
+    def _robot_vector(self, robot: Robot, attr: str, default: float) -> np.ndarray:
+        values = getattr(robot, attr, None)
+        if values is None:
+            return np.full(ACT_DIM, default, dtype=np.float32)
+        return np.asarray(values, dtype=np.float32).reshape(ACT_DIM)
+
+    def log(
+        self,
+        *,
+        step: int,
+        obs: np.ndarray,
+        robot_obs: RobotObservation,
+        action: np.ndarray,
+        target_rel: np.ndarray,
+        env: Go2FootStandEnv,
+        robot: Robot,
+    ) -> None:
         if self._writer is None:
             self.start()
 
         q_rel = np.asarray(robot_obs.joint_position, dtype=np.float32).reshape(ACT_DIM)
         q_abs = q_rel + Q0_SIM
         dq = np.asarray(robot_obs.joint_velocity, dtype=np.float32).reshape(ACT_DIM)
+        gyro = np.asarray(robot_obs.gyroscope, dtype=np.float32).reshape(3)
+        quat = np.asarray(robot_obs.quaternion, dtype=np.float32).reshape(4)
+        action = np.asarray(action, dtype=np.float32).reshape(ACT_DIM)
+        target_rel = np.asarray(target_rel, dtype=np.float32).reshape(ACT_DIM)
+        target_abs = np.asarray(env.motor_targets_abs, dtype=np.float32).reshape(ACT_DIM)
+        requested_q = self._robot_vector(robot, "last_requested_q_real", np.nan)
+        lowcmd_q = self._robot_vector(robot, "last_lowcmd_q_real", np.nan)
+        lowcmd_kp = self._robot_vector(robot, "last_lowcmd_kp_real", np.nan)
+        lowcmd_kd = self._robot_vector(robot, "last_lowcmd_kd_real", np.nan)
+        estimated_tau = self._robot_vector(robot, "last_estimated_tau_real", np.nan)
+        torque_limits = self._robot_vector(robot, "torque_limits_real", np.nan)
+        limiter_hits = np.asarray(
+            getattr(robot, "last_torque_limit_hit_real", [False] * ACT_DIM),
+            dtype=np.int32,
+        ).reshape(ACT_DIM)
+        torque_limit_hits_total = int(getattr(robot, "torque_limit_hits", 0))
+        if self._start_torque_limit_hits is None:
+            self._start_torque_limit_hits = torque_limit_hits_total
+        if self._last_torque_limit_hits is None:
+            torque_limit_hits_delta = 0
+        else:
+            torque_limit_hits_delta = (
+                torque_limit_hits_total - self._last_torque_limit_hits
+            )
+        self._last_torque_limit_hits = torque_limit_hits_total
+        torque_limit_hits_since_start = (
+            torque_limit_hits_total - self._start_torque_limit_hits
+        )
+
         now = datetime.now(BEIJING_TZ).isoformat(timespec="milliseconds")
         elapsed = time.perf_counter() - self._start_perf
         row = [
             now,
             f"{elapsed:.6f}",
+            int(step),
+            f"{float(np.linalg.norm(obs)):.8f}",
+            f"{float(np.min(action)):.8f}",
+            f"{float(np.max(action)):.8f}",
+            f"{float(np.min(target_rel)):.8f}",
+            f"{float(np.max(target_rel)):.8f}",
+            *[f"{float(v):.8f}" for v in gyro],
+            *[f"{float(v):.8f}" for v in quat],
+            f"{float(robot_obs.roll):.8f}",
+            f"{float(robot_obs.pitch):.8f}",
+            f"{float(robot_obs.yaw):.8f}",
             *[f"{float(v):.8f}" for v in q_abs],
+            *[f"{float(v):.8f}" for v in q_rel],
             *[f"{float(v):.8f}" for v in dq],
+            *[f"{float(v):.8f}" for v in action],
+            *[f"{float(v):.8f}" for v in env.current_actions],
+            *[f"{float(v):.8f}" for v in env.last_actions],
+            *[f"{float(v):.8f}" for v in target_abs],
+            *[f"{float(v):.8f}" for v in target_rel],
+            int(bool(getattr(robot, "torque_limit_enabled", False))),
+            f"{float(getattr(robot, 'torque_limit_scale', np.nan)):.8f}",
+            torque_limit_hits_total,
+            torque_limit_hits_since_start,
+            torque_limit_hits_delta,
+            f"{float(getattr(robot, 'max_estimated_tau', np.nan)):.8f}",
+            *[f"{float(v):.8f}" for v in requested_q],
+            *[f"{float(v):.8f}" for v in lowcmd_q],
+            *[f"{float(v):.8f}" for v in lowcmd_kp],
+            *[f"{float(v):.8f}" for v in lowcmd_kd],
+            *[f"{float(v):.8f}" for v in estimated_tau],
+            *[f"{float(v):.8f}" for v in torque_limits],
+            *[int(v) for v in limiter_hits],
         ]
         self._writer.writerow(row)
         self._rows += 1
@@ -1021,7 +1148,7 @@ def move_to_footstand_start_pose(
     start_rel_real = _dof_to_ctrl_order(
         np.asarray(start_obs.joint_position, dtype=np.float32)
     )
-    target_rel_real = np.zeros(ACT_DIM, dtype=np.float32)
+    target_rel_real = FOOTSTAND_START_REL_REAL.astype(np.float32, copy=True)
     previous_kp = robot.kp
     previous_kd = robot.kd
 
@@ -1029,6 +1156,10 @@ def move_to_footstand_start_pose(
         "Moving to UniLab Go2FootStand start pose "
         f"for {move_seconds:.2f}s, then confirming "
         f"q_err<={q_tolerance:.3f}rad and |dq|<={dq_tolerance:.3f}rad/s"
+    )
+    print(
+        "FootStand start pose real-order q: "
+        f"{_format_real_pose(FOOTSTAND_START_Q_REAL)}"
     )
     print("Using stand gains for FootStand start-pose alignment")
 
@@ -1057,7 +1188,9 @@ def move_to_footstand_start_pose(
             latest_obs = robot.get_obs()
             latest_q_rel = np.asarray(latest_obs.joint_position, dtype=np.float32).reshape(ACT_DIM)
             latest_dq = np.asarray(latest_obs.joint_velocity, dtype=np.float32).reshape(ACT_DIM)
-            q_err = float(np.max(np.abs(latest_q_rel)))
+            latest_q_abs = latest_q_rel + Q0_SIM
+            q_err_by_joint = latest_q_abs - FOOTSTAND_START_Q_SIM
+            q_err = float(np.max(np.abs(q_err_by_joint)))
             dq_abs = float(np.max(np.abs(latest_dq)))
             best_q_err = min(best_q_err, q_err)
             best_dq = min(best_dq, dq_abs)
@@ -1073,16 +1206,19 @@ def move_to_footstand_start_pose(
         robot.kp = previous_kp
         robot.kd = previous_kd
 
-    worst_q_idx = int(np.argmax(np.abs(latest_q_rel)))
+    latest_q_abs = latest_q_rel + Q0_SIM
+    q_err_by_joint = latest_q_abs - FOOTSTAND_START_Q_SIM
+    worst_q_idx = int(np.argmax(np.abs(q_err_by_joint)))
     worst_dq_idx = int(np.argmax(np.abs(latest_dq)))
     worst_q_name = sim_index_to_name[worst_q_idx]
     worst_dq_name = sim_index_to_name[worst_dq_idx]
     raise RuntimeError(
         "FootStand start pose was not reached before timeout: "
         f"best_q_err={best_q_err:.3f}rad best_max_dq={best_dq:.3f}rad/s; "
-        f"latest_worst_q={worst_q_name} rel={latest_q_rel[worst_q_idx]:.3f}rad "
-        f"abs={(latest_q_rel[worst_q_idx] + Q0_SIM[worst_q_idx]):.3f}rad "
-        f"target={Q0_SIM[worst_q_idx]:.3f}rad; "
+        f"latest_worst_q={worst_q_name} err={q_err_by_joint[worst_q_idx]:.3f}rad "
+        f"rel={latest_q_rel[worst_q_idx]:.3f}rad "
+        f"abs={latest_q_abs[worst_q_idx]:.3f}rad "
+        f"target={FOOTSTAND_START_Q_SIM[worst_q_idx]:.3f}rad; "
         f"latest_worst_dq={worst_dq_name} dq={latest_dq[worst_dq_idx]:.3f}rad/s"
     )
 
@@ -1226,6 +1362,7 @@ def main(args) -> None:
 
     benchmark_times = []
     last_debug = 0.0
+    footstand_step = 0
     relaxed_before_exit = False
     try:
         wait_for_button(footstand_env, "L1", "Robot initialized, press L1 to stand")
@@ -1311,14 +1448,27 @@ def main(args) -> None:
                 footstand_env.reset_control_state(robot_obs)
                 active_env = footstand_env
                 active_policy = footstand_policy
+                footstand_step = 0
                 obs, _ = active_env.observe(robot_obs)
                 print("Switched to FootStand policy")
-                print(f"Logging FootStand joint pos/vel to {footstand_logger.start()}")
+                print(
+                    "Logging FootStand policy/control/tau state to "
+                    f"{footstand_logger.start()}"
+                )
 
             action = active_policy(obs)
-            active_env.advance(action)
+            target_rel = active_env.advance(action)
             if active_state == FOOTSTAND_STATE:
-                footstand_logger.log(robot_obs)
+                footstand_step += 1
+                footstand_logger.log(
+                    step=footstand_step,
+                    obs=obs,
+                    robot_obs=robot_obs,
+                    action=action,
+                    target_rel=target_rel,
+                    env=active_env,
+                    robot=robot,
+                )
 
             if args.debug_command and begin - last_debug >= 0.5:
                 print(

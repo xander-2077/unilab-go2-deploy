@@ -62,10 +62,13 @@ The runtime state machine loads both policies:
 - after stand-up finishes, it holds the final FixStand posture for 2 seconds before handing control to the velocity policy; tune this with `--post-stand-delay`.
 - after L1 is released, press L1 again to switch once into the selected Go2FootStand checkpoint.
 - before switching to FootStand, it runs the velocity policy with a zero command for 0.75 seconds; tune this with `--pre-footstand-hold-seconds`.
-- then it interpolates the joints to the UniLab Go2FootStand reset pose (`Q0`) and only starts FootStand after measured joint error and velocity are within tolerance.
+- then it interpolates the joints to the shared UniLab Go2FootStand start pose and only starts FootStand after measured joint error and velocity are within tolerance. In sim order `FL,FR,RL,RR`, this pose is `[0,0.8,-1.5, 0,0.8,-1.5, 0,1.0,-1.5, 0,1.0,-1.5]`.
 - `--velocity-policy` can override the joystick policy path; use `models/Go2JoystickFlat/policy.onnx` here if you want the ONNX joystick policy.
 - `--policy` or `--policy-ckpt` selects the FootStand policy.
-- after switching to FootStand, joint absolute position and velocity are logged to `logs/footstand_<ckpt>_<YYYYmmdd_HHMMSS_BJT>.csv`; use `--log-dir` to change the output directory.
+- after switching to FootStand, the logger writes observation, action, target,
+  LowCmd, and torque-limiter fields to
+  `logs/footstand_<ckpt>_<YYYYmmdd_HHMMSS_BJT>.csv`; use `--log-dir` to change
+  the output directory.
 
 The default `walk_these_ways` velocity adapter matches the legacy TorchScript ABI:
 

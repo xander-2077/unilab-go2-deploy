@@ -102,6 +102,21 @@ class Go2FootStandAbiTest(unittest.TestCase):
             np.array([3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8], dtype=np.int32),
         )
 
+    def test_footstand_start_pose_matches_unilab_home_in_sim_and_real_order(self) -> None:
+        expected_sim = np.array(
+            [0.0, 0.8, -1.5, 0.0, 0.8, -1.5, 0.0, 1.0, -1.5, 0.0, 1.0, -1.5],
+            dtype=np.float32,
+        )
+        expected_real = expected_sim[deploy.DOF_TO_CTRL]
+
+        np.testing.assert_allclose(deploy.FOOTSTAND_START_Q_SIM, expected_sim)
+        np.testing.assert_allclose(deploy.FOOTSTAND_START_Q_REAL, expected_real)
+        np.testing.assert_allclose(
+            deploy.FOOTSTAND_START_REL_REAL,
+            deploy.FOOTSTAND_START_Q_REAL - deploy.Q0_REAL,
+        )
+        self.assertFalse(np.allclose(deploy.STAND_Q_REAL, deploy.FOOTSTAND_START_Q_REAL))
+
     def test_stand_targets_match_unitree_fixstand_waypoints(self) -> None:
         np.testing.assert_allclose(
             deploy.STAND_RECOVER_Q_REAL,
@@ -152,11 +167,20 @@ class Go2FootStandAbiTest(unittest.TestCase):
         robot.torque_limit_enabled = False
         robot.torque_limits_real = [0.0] * deploy.ACT_DIM
         robot.max_estimated_tau = 0.0
+        robot.torque_limit_hits = 0
 
         cmd = robot._init_lowcmd()
         robot._write_lowcmd_motor_commands(cmd)
 
         expected_q = deploy.Q0_REAL + np.asarray(robot.Δq_real, dtype=np.float32)
+        np.testing.assert_allclose(robot.last_requested_q_real, expected_q)
+        np.testing.assert_allclose(robot.last_lowcmd_q_real, expected_q)
+        np.testing.assert_allclose(
+            robot.last_estimated_tau_real,
+            35.0 * np.asarray(robot.Δq_real),
+            atol=1.0e-6,
+        )
+        self.assertFalse(any(robot.last_torque_limit_hit_real))
         for i in range(deploy.ACT_DIM):
             motor_cmd = cmd.motor_cmd[i]
             self.assertEqual(motor_cmd.mode, 0x01)
@@ -254,9 +278,45 @@ class Go2FootStandAbiTest(unittest.TestCase):
             logger = deploy.FootstandJointLogger(log_dir, policy_path, flush_every=1)
             joint_position = np.linspace(-0.01, 0.01, deploy.ACT_DIM, dtype=np.float32)
             joint_velocity = np.linspace(0.1, 1.2, deploy.ACT_DIM, dtype=np.float32)
+            action = np.linspace(-0.5, 0.5, deploy.ACT_DIM, dtype=np.float32)
+            robot_obs = _robot_obs(
+                joint_position=joint_position,
+                joint_velocity=joint_velocity,
+                gyroscope=np.array([0.1, -0.2, 0.3], dtype=np.float32),
+            )
+            env = deploy.Go2FootStandEnv(None)
+            env.reset_control_state(robot_obs)
+            target_rel = env.advance(action, set_act=False)
+            target_abs = np.asarray(env.motor_targets_abs, dtype=np.float32)
+            requested_q = target_abs.copy()
+            lowcmd_q = target_abs - np.linspace(0.0, 0.011, deploy.ACT_DIM, dtype=np.float32)
+            estimated_tau = np.linspace(-3.0, 8.0, deploy.ACT_DIM, dtype=np.float32)
+            limiter_hits = [False] * deploy.ACT_DIM
+            limiter_hits[0] = True
+            robot = SimpleNamespace(
+                torque_limit_enabled=True,
+                torque_limit_scale=1.0,
+                torque_limit_hits=3,
+                max_estimated_tau=12.5,
+                last_requested_q_real=requested_q,
+                last_lowcmd_q_real=lowcmd_q,
+                last_lowcmd_kp_real=[35.0] * deploy.ACT_DIM,
+                last_lowcmd_kd_real=[0.5] * deploy.ACT_DIM,
+                last_estimated_tau_real=estimated_tau,
+                torque_limits_real=[25.0, 40.0, 40.0] * 4,
+                last_torque_limit_hit_real=limiter_hits,
+            )
 
             path = logger.start()
-            logger.log(_robot_obs(joint_position=joint_position, joint_velocity=joint_velocity))
+            logger.log(
+                step=7,
+                obs=np.ones(deploy.Go2FootStandEnv.obs_dim, dtype=np.float32),
+                robot_obs=robot_obs,
+                action=action,
+                target_rel=target_rel,
+                env=env,
+                robot=robot,
+            )
             logger.close()
 
             self.assertIn("2026-05-21_14-16-56_mujoco", path.name)
@@ -265,12 +325,37 @@ class Go2FootStandAbiTest(unittest.TestCase):
             self.assertEqual(len(rows), 2)
             header = rows[0].split(",")
             values = rows[1].split(",")
-            self.assertEqual(header[0:2], ["beijing_time", "elapsed_s"])
-            self.assertEqual(header[2], "q_abs_FL_hip_joint")
-            self.assertEqual(header[14], "dq_FL_hip_joint")
+            self.assertEqual(header[0:3], ["wall_time_iso", "elapsed_s", "step"])
+            self.assertIn("q_abs_sim_FL_hip_joint", header)
+            self.assertIn("q_rel_sim_FL_hip_joint", header)
+            self.assertIn("dq_sim_FL_hip_joint", header)
+            self.assertIn("action_ctrl_FR_hip_joint", header)
+            self.assertIn("target_abs_real_FR_hip_joint", header)
+            self.assertIn("lowcmd_q_real_FR_hip_joint", header)
+            self.assertIn("estimated_tau_real_FR_hip_joint", header)
+            self.assertIn("torque_limit_hit_real_FR_hip_joint", header)
             expected_q_abs = deploy.Q0_SIM + joint_position
-            self.assertAlmostEqual(float(values[2]), float(expected_q_abs[0]), places=6)
-            self.assertAlmostEqual(float(values[14]), float(joint_velocity[0]), places=6)
+            self.assertEqual(values[2], "7")
+            self.assertAlmostEqual(
+                float(values[header.index("q_abs_sim_FL_hip_joint")]),
+                float(expected_q_abs[0]),
+                places=6,
+            )
+            self.assertAlmostEqual(
+                float(values[header.index("dq_sim_FL_hip_joint")]),
+                float(joint_velocity[0]),
+                places=6,
+            )
+            self.assertEqual(int(values[header.index("torque_limit_hits_total")]), 3)
+            self.assertEqual(
+                int(values[header.index("torque_limit_hit_real_FR_hip_joint")]),
+                1,
+            )
+            self.assertAlmostEqual(
+                float(values[header.index("lowcmd_q_real_FR_hip_joint")]),
+                float(lowcmd_q[0]),
+                places=6,
+            )
 
     def test_build_env_uses_unfiltered_footstand_action_abi_by_default(self) -> None:
         env = deploy.build_env(deploy.Go2FootStandEnv.obs_dim, None, _args())
@@ -567,7 +652,7 @@ class Go2FootStandAbiTest(unittest.TestCase):
 
         self.assertIsInstance(obs, RobotObservation)
         self.assertGreaterEqual(len(robot.commands), 1)
-        np.testing.assert_allclose(robot.commands[-1], 0.0)
+        np.testing.assert_allclose(robot.commands[-1], deploy.FOOTSTAND_START_REL_REAL)
         self.assertEqual(robot.kp, 35.0)
         self.assertEqual(robot.kd, 0.5)
 

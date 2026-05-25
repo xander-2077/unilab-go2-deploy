@@ -87,6 +87,12 @@ class Robot():
         ]
         self.torque_limit_hits = 0
         self.max_estimated_tau = 0.0
+        self.last_requested_q_real = [math.nan] * 12
+        self.last_lowcmd_q_real = [math.nan] * 12
+        self.last_lowcmd_kp_real = [0.0] * 12
+        self.last_lowcmd_kd_real = [0.0] * 12
+        self.last_estimated_tau_real = [0.0] * 12
+        self.last_torque_limit_hit_real = [False] * 12
 
         self.Δq_real = [None for _ in range(12)]  # in real order
         self.q_setted = False
@@ -220,9 +226,17 @@ class Robot():
         return cmd
 
     def _write_lowcmd_motor_commands(self, cmd):
+        requested_qs = []
+        lowcmd_qs = []
+        kp_cmds = []
+        kd_cmds = []
+        tau_ests = []
+        limiter_hits = []
         for i in range(12):
-            q_cmd, kp_cmd, kd_cmd, tau_est = self._limited_pd_command(
-                i, q0_real[i] + self.Δq_real[i]
+            requested_q = q0_real[i] + self.Δq_real[i]
+            q_cmd, kp_cmd, kd_cmd, tau_est, limiter_hit = self._limited_pd_command(
+                i,
+                requested_q,
             )
             cmd.motor_cmd[i].mode = LOWCMD_MOTOR_MODE  # (PMSM) mode
             cmd.motor_cmd[i].q = q_cmd
@@ -231,6 +245,18 @@ class Robot():
             cmd.motor_cmd[i].kd = kd_cmd
             cmd.motor_cmd[i].tau = LOWCMD_FEEDFORWARD_TAU
             self.max_estimated_tau = max(self.max_estimated_tau, abs(tau_est))
+            requested_qs.append(float(requested_q))
+            lowcmd_qs.append(float(q_cmd))
+            kp_cmds.append(float(kp_cmd))
+            kd_cmds.append(float(kd_cmd))
+            tau_ests.append(float(tau_est))
+            limiter_hits.append(bool(limiter_hit))
+        self.last_requested_q_real = requested_qs
+        self.last_lowcmd_q_real = lowcmd_qs
+        self.last_lowcmd_kp_real = kp_cmds
+        self.last_lowcmd_kd_real = kd_cmds
+        self.last_estimated_tau_real = tau_ests
+        self.last_torque_limit_hit_real = limiter_hits
 
     def _send_loop(self):
         cmd = self._init_lowcmd()
@@ -252,21 +278,21 @@ class Robot():
         kp_cmd = self._gain_at(self.kp, motor_idx)
         kd_cmd = self._gain_at(self.kd, motor_idx)
         if self.motor_state_real is None:
-            return q_cmd, kp_cmd, kd_cmd, 0.0
+            return q_cmd, kp_cmd, kd_cmd, 0.0, False
 
         state = self.motor_state_real[motor_idx]
         q_meas = float(state.q)
         dq = float(state.dq)
         tau_est = kp_cmd * (q_cmd - q_meas) - kd_cmd * dq
         if not self.torque_limit_enabled:
-            return q_cmd, kp_cmd, kd_cmd, tau_est
+            return q_cmd, kp_cmd, kd_cmd, tau_est, False
 
         limit = float(self.torque_limits_real[motor_idx])
         if limit <= 0.0:
-            return q_cmd, kp_cmd, kd_cmd, tau_est
+            return q_cmd, kp_cmd, kd_cmd, tau_est, False
 
         if abs(tau_est) <= limit:
-            return q_cmd, kp_cmd, kd_cmd, tau_est
+            return q_cmd, kp_cmd, kd_cmd, tau_est, False
 
         self.torque_limit_hits += 1
         tau_limited = max(min(tau_est, limit), -limit)
@@ -278,14 +304,14 @@ class Robot():
             )
             tau_est = kp_cmd * (q_cmd - q_meas) - kd_cmd * dq
             if abs(tau_est) <= limit:
-                return q_cmd, kp_cmd, kd_cmd, tau_est
+                return q_cmd, kp_cmd, kd_cmd, tau_est, True
 
         if abs(dq) > 1.0e-6:
             kd_cmd = min(kd_cmd, limit / abs(dq))
         if kp_cmd > 1.0e-6:
             q_cmd = q_meas
         tau_est = kp_cmd * (q_cmd - q_meas) - kd_cmd * dq
-        return q_cmd, kp_cmd, kd_cmd, tau_est
+        return q_cmd, kp_cmd, kd_cmd, tau_est, True
 
     def get_obs(self):
         # joint pos & vel
