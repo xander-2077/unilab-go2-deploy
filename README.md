@@ -22,7 +22,7 @@ Policy files are expected under `models/<TaskName>/policy.onnx` or checkpoint
 subdirectories such as `models/Go2FootStand/<CheckpointName>/policy.onnx`, for example:
 
 - `models/Go2FootStand/policy.onnx`
-- `models/Go2FootStand/2026-05-22_06-14-41_mujoco/policy.onnx`
+- `models/Go2FootStand/2026-05-24_05-19-37_mujoco/policy.onnx`
 - `models/Go2JoystickFlat/policy.onnx`
 - `models/walk_these_ways/body_latest.jit`
 - `models/walk_these_ways/adaptation_module_latest.jit`
@@ -43,15 +43,18 @@ You can list or select checkpoints with:
 
 ```bash
 ./run.sh python deploy.py --list-policy-ckpts
-./run.sh python deploy.py --policy-ckpt 2026-05-22_06-14-41_mujoco
+./run.sh python deploy.py --policy-ckpt 2026-05-24_05-19-37_mujoco
 ./run.sh python deploy.py --policy-ckpt latest
 ```
 
 The direct path form is still supported and overrides `--policy-ckpt`:
 
 ```bash
-./run.sh python deploy.py --policy models/Go2FootStand/2026-05-22_06-14-41_mujoco/policy.onnx
+./run.sh python deploy.py --policy models/Go2FootStand/2026-05-24_05-19-37_mujoco/policy.onnx
 ```
+
+If launching from the repository root instead of inside `deployment/`, the
+same checkpoint can also be passed as `deployment/models/Go2FootStand/2026-05-24_05-19-37_mujoco/policy.onnx`.
 
 The runtime state machine loads both policies:
 
@@ -73,10 +76,10 @@ The default `walk_these_ways` velocity adapter matches the legacy TorchScript AB
 The deployment adapter matches the UniLab `Go2FootStand` actor ABI:
 
 - Current distilled FootStand checkpoints consume 42 values per frame: gyro, local gravity, joint position delta, joint velocity, previous action.
-- The 15-frame observation history is flattened to 630 values for the distilled actor, matching `2026-05-22_06-14-41_mujoco`.
+- The 15-frame observation history is flattened to 630 values for the distilled actor, matching `2026-05-24_05-19-37_mujoco`.
 - Legacy 675-value FootStand checkpoints are still supported by selecting the 45-value frame adapter, which keeps a zero-filled local linear velocity slot.
-- 12 actions in Unitree real/control order, clipped to `[-1, 1]`, integrated into motor targets with `action_scale=0.25`.
-- FootStand actions are applied with a one-control-step delay, matching `simulate_action_latency=true` in the training config.
+- 12 actions in Unitree real/control order, clipped to `[-1, 1]`, integrated into motor targets with `action_scale=0.3`.
+- FootStand actions are applied immediately, matching the `simulate_action_latency=false` default used by `train_rsl_rl_student_finetune.py` for this run.
 - By default FootStand actions are not filtered or delta-limited, matching UniLab `Go2FootStandTask.apply_action()`.
 
 The first L1 stand-up phase follows the Unitree/mjlab Go2 `FixStand` trajectory:

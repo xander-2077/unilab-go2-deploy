@@ -95,7 +95,7 @@ class Go2FootStandAbiTest(unittest.TestCase):
         self.assertEqual(deploy.FOOTSTAND_HISTORY_LEN, 15)
         self.assertEqual(deploy.Go2FootStandEnv.obs_dim, 630)
         self.assertEqual(deploy.Go2FootStandEnv.legacy_obs_dim, 675)
-        self.assertEqual(deploy.FOOTSTAND_ACTION_SCALE, 0.25)
+        self.assertEqual(deploy.FOOTSTAND_ACTION_SCALE, 0.3)
         np.testing.assert_array_equal(
             deploy.DOF_TO_CTRL,
             np.array([3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8], dtype=np.int32),
@@ -150,6 +150,26 @@ class Go2FootStandAbiTest(unittest.TestCase):
                 policy_ckpt="2026-05-21_09-37-52_mujoco",
             )
             self.assertEqual(deploy.resolve_policy_path(root, args), old_dir / "policy.onnx")
+
+    def test_resolve_policy_path_accepts_repo_root_deployment_prefix(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "deployment"
+            policy_path = (
+                root
+                / "models"
+                / "Go2FootStand"
+                / "2026-05-24_05-19-37_mujoco"
+                / "policy.onnx"
+            )
+            policy_path.parent.mkdir(parents=True)
+            policy_path.touch()
+            args = _args(
+                policy=Path(
+                    "deployment/models/Go2FootStand/2026-05-24_05-19-37_mujoco/policy.onnx"
+                )
+            )
+
+            self.assertEqual(deploy.resolve_policy_path(root, args), policy_path)
 
     def test_wait_for_button_repress_requires_release_before_second_press(self) -> None:
         env = _ButtonSequenceEnv([True, True, False, False, True])
@@ -214,7 +234,7 @@ class Go2FootStandAbiTest(unittest.TestCase):
 
         self.assertIsInstance(env, deploy.Go2FootStandEnv)
         self.assertFalse(env.include_linvel)
-        self.assertTrue(env.simulate_action_latency)
+        self.assertFalse(env.simulate_action_latency)
         self.assertEqual(env.action_filter_alpha, 1.0)
         self.assertEqual(env.max_action_delta, 0.0)
 
@@ -401,7 +421,7 @@ class Go2FootStandAbiTest(unittest.TestCase):
         )
         np.testing.assert_allclose(frames[-1, -deploy.ACT_DIM :], first_action)
 
-    def test_footstand_actions_integrate_with_training_action_latency(self) -> None:
+    def test_footstand_actions_integrate_like_unilab_student_finetune(self) -> None:
         env = deploy.Go2FootStandEnv(None)
         joint_position = np.linspace(-0.03, 0.03, deploy.ACT_DIM, dtype=np.float32)
         robot_obs = _robot_obs(joint_position=joint_position)
@@ -420,15 +440,16 @@ class Go2FootStandAbiTest(unittest.TestCase):
         )
         target_rel = env.advance(raw_action, set_act=False)
         exec_action = np.clip(raw_action, -1.0, 1.0)
-        np.testing.assert_allclose(env.current_actions, exec_action)
-        np.testing.assert_allclose(target_rel, start_abs - deploy.Q0_REAL)
-
-        target_rel = env.advance(np.zeros(deploy.ACT_DIM, dtype=np.float32), set_act=False)
         expected_abs = np.clip(
             start_abs + exec_action * deploy.FOOTSTAND_ACTION_SCALE,
             deploy.REAL_POSITION_LOW,
             deploy.REAL_POSITION_HIGH,
         )
+        np.testing.assert_allclose(env.current_actions, exec_action)
+        np.testing.assert_allclose(env.last_actions, 0.0)
+        np.testing.assert_allclose(target_rel, expected_abs - deploy.Q0_REAL)
+
+        target_rel = env.advance(np.zeros(deploy.ACT_DIM, dtype=np.float32), set_act=False)
 
         np.testing.assert_allclose(env.last_actions, exec_action)
         np.testing.assert_allclose(env.current_actions, 0.0)

@@ -7,6 +7,10 @@ __pycache__/
 
 # Local virtual environment
 .venv/
+.uv-cache/
+.cyclonedds/
+.cyclonedds-build/
+.cyclonedds-src/
 
 # Local machine/runtime configuration
 .env

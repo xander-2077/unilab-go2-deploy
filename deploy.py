@@ -44,7 +44,7 @@ ACT_DIM = 12
 CTRL_DT = 0.02
 GAIT_FREQUENCY = 2.0
 JOYSTICK_ACTION_SCALE = 0.25
-FOOTSTAND_ACTION_SCALE = 0.25
+FOOTSTAND_ACTION_SCALE = 0.3
 WTW_FRAME_OBS_DIM = 70
 WTW_HISTORY_LEN = 30
 WTW_OBS_DIM = WTW_FRAME_OBS_DIM * WTW_HISTORY_LEN
@@ -131,7 +131,16 @@ PolicyFn = Callable[[np.ndarray], np.ndarray]
 
 
 def _resolve_path(root: Path, path: Path) -> Path:
-    return path if path.is_absolute() else root / path
+    if path.is_absolute():
+        return path
+
+    resolved = root / path
+    if resolved.exists():
+        return resolved
+
+    if path.parts and path.parts[0] == root.name:
+        return root.parent / path
+    return resolved
 
 
 def discover_policy_ckpts(policy_root: Path) -> list[tuple[str, Path, bool]]:
@@ -693,7 +702,7 @@ class Go2FootStandEnv:
         action_filter_alpha: float = 1.0,
         max_action_delta: float = 0.0,
         include_linvel: bool = False,
-        simulate_action_latency: bool = True,
+        simulate_action_latency: bool = False,
     ):
         self.robot = robot
         self.include_linvel = bool(include_linvel)
