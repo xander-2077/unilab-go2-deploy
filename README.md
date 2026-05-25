@@ -108,6 +108,12 @@ It estimates `kp * (q_cmd - q_measured) - kd * dq` before each lowcmd publish an
 The default policy-control limit ramps from `0.45 *` to `0.65 *` the URDF limits over the first 3 seconds, then holds `0.65 *` for the task.
 If the robot still overloads, lower `--torque-limit-scale`; if it cannot rise but `tau_hits` stays high, raise it gradually while watching motor temperature and error lights.
 
+When running against `unitree_mujoco` with `--sim`, the deploy-side torque limiter
+is disabled by default so the LowCmd stream is the same position-control pipeline
+used by the MuJoCo bridge: absolute `q`, `dq=0`, `tau=0`, and per-motor `kp/kd`.
+Use `--enable-sim-torque-limit` only when deliberately testing the deploy
+limiter in simulation.
+
 ## Go2JoystickFlat
 
 Use Go2JoystickFlat as the optional ONNX velocity-tracking stage:

@@ -6,11 +6,9 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import numpy as np
-import onnxruntime as ort
-import torch
 
 from misc.consts import (
     clip_actions_high,
@@ -28,8 +26,10 @@ from misc.consts import (
     stand_q_real,
     stand_recover_q_real,
 )
-from robot import Robot, RobotObservation
 from utils.math_utils import project_gravity
+
+if TYPE_CHECKING:
+    from robot import Robot, RobotObservation
 
 
 JOYSTICK_OBS_DIM = 49
@@ -203,6 +203,14 @@ def _fixed_dim(shape: list, axis: int, label: str) -> int:
 
 
 def load_onnx_policy(path: Path) -> tuple[PolicyFn, int]:
+    try:
+        import onnxruntime as ort
+    except ImportError as exc:
+        raise RuntimeError(
+            "onnxruntime is required to run ONNX policies. Install the "
+            "deployment requirements before launching the controller."
+        ) from exc
+
     session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
     input_meta = session.get_inputs()[0]
     output_meta = session.get_outputs()[0]
@@ -221,6 +229,14 @@ def load_onnx_policy(path: Path) -> tuple[PolicyFn, int]:
 
 
 def load_walk_these_ways_policy(path: Path) -> tuple[PolicyFn, int]:
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError(
+            "torch is required to run WalkTheseWays TorchScript policies. Install the "
+            "deployment requirements before launching the controller."
+        ) from exc
+
     if path.is_dir():
         body_path = path / WTW_BODY_FILE
         adaptation_path = path / WTW_ADAPTATION_FILE
@@ -887,6 +903,8 @@ def build_env(policy_obs_dim: int, robot: Optional[Robot], args):
 
 
 def mock_observation() -> RobotObservation:
+    from robot import RobotObservation
+
     return RobotObservation(
         joint_position=[0.0] * ACT_DIM,
         joint_velocity=[0.0] * ACT_DIM,
@@ -1168,11 +1186,21 @@ def main(args) -> None:
         return
 
     print("Connecting to robot and waiting for lowstate/IMU...", flush=True)
+    from robot import Robot
+
+    torque_limit_enabled = not args.disable_torque_limit
+    if args.sim and not args.enable_sim_torque_limit:
+        torque_limit_enabled = False
+        print(
+            "Sim control pipeline: deploy-side torque limiter disabled to match "
+            "unitree_mujoco position-actuator control."
+        )
+
     robot = Robot(
         is_sim=args.sim,
         network_interface=args.eth,
         torque_limit_scale=args.torque_limit_scale,
-        torque_limit_enabled=not args.disable_torque_limit,
+        torque_limit_enabled=torque_limit_enabled,
     )
     robot.set_run_gains(args.kp, args.kd)
     robot.set_stand_gains(args.stand_kp, args.stand_kd)
@@ -1221,7 +1249,7 @@ def main(args) -> None:
         active_env = velocity_env
         active_policy = velocity_policy
         policy_start_time = time.perf_counter()
-        if not args.disable_torque_limit:
+        if torque_limit_enabled:
             initial_torque_scale = (
                 args.startup_torque_limit_scale
                 if args.startup_torque_ramp_seconds > 0.0
@@ -1235,7 +1263,7 @@ def main(args) -> None:
 
         while True:
             begin = time.perf_counter()
-            if not args.disable_torque_limit and args.startup_torque_ramp_seconds > 0.0:
+            if torque_limit_enabled and args.startup_torque_ramp_seconds > 0.0:
                 alpha = min(
                     (begin - policy_start_time) / args.startup_torque_ramp_seconds,
                     1.0,
@@ -1395,6 +1423,14 @@ if __name__ == "__main__":
     parser.add_argument("--startup-torque-limit-scale", type=float, default=0.45)
     parser.add_argument("--startup-torque-ramp-seconds", type=float, default=3.0)
     parser.add_argument("--disable-torque-limit", action="store_true")
+    parser.add_argument(
+        "--enable-sim-torque-limit",
+        action="store_true",
+        help=(
+            "When --sim is set, keep the deploy-side torque limiter enabled. "
+            "By default sim disables it so LowCmd q/kp/kd matches unitree_mujoco."
+        ),
+    )
     parser.add_argument("--debug-command", action="store_true")
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--sim", action="store_true")

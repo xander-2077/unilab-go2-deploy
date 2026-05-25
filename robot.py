@@ -20,6 +20,12 @@ from unitree_sdk2py.utils.crc import CRC
 from misc.consts import *
 
 
+LOWCMD_WRITE_DT = 0.005
+LOWCMD_MOTOR_MODE = 0x01
+LOWCMD_TARGET_DQ = 0.0
+LOWCMD_FEEDFORWARD_TAU = 0.0
+
+
 @dataclass
 class RobotObservation:
     joint_position: "list[float]"
@@ -44,8 +50,10 @@ class Robot():
         is_sim=False,
         q_msg=None,
         network_interface=None,
+        domain_id=None,
+        ready_timeout=None,
         torque_limit_scale=0.65,
-        torque_limit_enabled=True,
+        torque_limit_enabled=None,
     ):
         """
         Args:
@@ -67,7 +75,10 @@ class Robot():
         self.run_kd = 0.5
         self.stand_kp = list(stand_kp_real)
         self.stand_kd = list(stand_kd_real)
-        self.torque_limit_enabled = bool(torque_limit_enabled)
+        self.torque_limit_enabled = self._default_torque_limit_enabled(
+            is_sim,
+            torque_limit_enabled,
+        )
         self.torque_limit_scale = float(torque_limit_scale)
         self.torque_limits_real = [
             max(0.0, float(limit) * self.torque_limit_scale)
@@ -84,7 +95,10 @@ class Robot():
 
         self.is_sim = is_sim
         if self.is_sim:
-            ChannelFactoryInitialize(1, "lo")
+            ChannelFactoryInitialize(
+                1 if domain_id is None else int(domain_id),
+                "lo" if network_interface is None else network_interface,
+            )
         elif network_interface is not None:
             ChannelFactoryInitialize(0, network_interface)
         else:
@@ -108,7 +122,17 @@ class Robot():
 
         self.crc = CRC()
 
+        deadline = None
+        if ready_timeout is not None:
+            deadline = time.perf_counter() + float(ready_timeout)
+
         while not self.q_setted or self.imu is None:
+            if deadline is not None and time.perf_counter() > deadline:
+                raise TimeoutError(
+                    "Timed out waiting for rt/lowstate and IMU. Start "
+                    "simulate_python/unitree_mujoco.py first, or check DDS "
+                    "domain/interface settings."
+                )
             time.sleep(0.01)
 
         self.background_thread = Thread(target=self._send_loop, daemon=True)
@@ -173,34 +197,47 @@ class Robot():
             ly = struct.unpack("f", bytes(wireless_remote[20:24]))[0]
             self.cmd_ball_vel = [lx, ly, rx, ry]
 
-    def _send_loop(self):
+    @staticmethod
+    def _default_torque_limit_enabled(is_sim: bool, requested):
+        if requested is None:
+            return not bool(is_sim)
+        return bool(requested)
+
+    def _init_lowcmd(self):
         cmd = unitree_go_msg_dds__LowCmd_()
         cmd.head[0] = 0xFE
         cmd.head[1] = 0xEF
         cmd.level_flag = 0xFF
         cmd.gpio = 0
         for i in range(20):
-            cmd.motor_cmd[i].mode = 0x01  # (PMSM) mode
+            cmd.motor_cmd[i].mode = LOWCMD_MOTOR_MODE  # (PMSM) mode
             cmd.motor_cmd[i].q = PosStopF
             cmd.motor_cmd[i].dq = VelStopF
             cmd.motor_cmd[i].kp = 0
             cmd.motor_cmd[i].kd = 0
             cmd.motor_cmd[i].tau = 0
+        return cmd
+
+    def _write_lowcmd_motor_commands(self, cmd):
+        for i in range(12):
+            q_cmd, kp_cmd, kd_cmd, tau_est = self._limited_pd_command(
+                i, q0_real[i] + self.Δq_real[i]
+            )
+            cmd.motor_cmd[i].mode = LOWCMD_MOTOR_MODE  # (PMSM) mode
+            cmd.motor_cmd[i].q = q_cmd
+            cmd.motor_cmd[i].dq = LOWCMD_TARGET_DQ
+            cmd.motor_cmd[i].kp = kp_cmd
+            cmd.motor_cmd[i].kd = kd_cmd
+            cmd.motor_cmd[i].tau = LOWCMD_FEEDFORWARD_TAU
+            self.max_estimated_tau = max(self.max_estimated_tau, abs(tau_est))
+
+    def _send_loop(self):
+        cmd = self._init_lowcmd()
 
         while not self.stopped.wait(
-            0.005
-        ):  # wait for 5ms until stopped.set() is called
-            for i in range(12):
-                q_cmd, kp_cmd, kd_cmd, tau_est = self._limited_pd_command(
-                    i, q0_real[i] + self.Δq_real[i]
-                )
-                cmd.motor_cmd[i].mode = 0x01  # (PMSM) mode
-                cmd.motor_cmd[i].q = q_cmd
-                cmd.motor_cmd[i].dq = 0
-                cmd.motor_cmd[i].kp = kp_cmd
-                cmd.motor_cmd[i].kd = kd_cmd
-                cmd.motor_cmd[i].tau = 0
-                self.max_estimated_tau = max(self.max_estimated_tau, abs(tau_est))
+            LOWCMD_WRITE_DT
+        ):  # wait for LOWCMD_WRITE_DT until stopped.set() is called
+            self._write_lowcmd_motor_commands(cmd)
             # print(f"q0_real: {q0_real}")
             # print(f"Δq_real: {self.Δq_real}")
             cmd.crc = self.crc.Crc(cmd)
