@@ -1455,6 +1455,9 @@ def main(args) -> None:
                     "Logging FootStand policy/control/tau state to "
                     f"{footstand_logger.start()}"
                 )
+                # Restart the control loop after the blocking transition work so
+                # FootStand policy timing starts from a fresh 50 Hz tick.
+                continue
 
             action = active_policy(obs)
             target_rel = active_env.advance(action)

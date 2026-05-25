@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -265,6 +266,14 @@ class Go2FootStandAbiTest(unittest.TestCase):
         self.assertEqual(state_machine.update(_robot_obs(L1=False)), deploy.VELOCITY_STATE)
         self.assertEqual(state_machine.update(_robot_obs(L1=True)), deploy.FOOTSTAND_STATE)
         self.assertEqual(state_machine.update(_robot_obs(L1=False)), deploy.FOOTSTAND_STATE)
+
+    def test_main_restarts_loop_after_footstand_transition(self) -> None:
+        source = inspect.getsource(deploy.main)
+        marker_idx = source.index("Logging FootStand policy/control/tau state")
+        continue_idx = source.index("continue", marker_idx)
+        action_idx = source.index("action = active_policy(obs)", marker_idx)
+
+        self.assertLess(continue_idx, action_idx)
 
     def test_footstand_joint_logger_writes_ckpt_and_beijing_time_csv(self) -> None:
         with TemporaryDirectory() as tmp:
