@@ -17,7 +17,8 @@ __pycache__/
 *.log
 
 # Robot deployment artifacts and checkpoints
-models/
+models/*
+models/Go2FootStand/*
 ckpt/
 record/
 debug/
@@ -26,6 +27,9 @@ logs/
 *.pt
 *.jit
 *.pth
+!models/Go2FootStand/
+!models/Go2FootStand/2026-05-24_23-11-48_mujoco/
+!models/Go2FootStand/2026-05-24_23-11-48_mujoco/**
 
 # Local backups and temporary files
 backup_*/

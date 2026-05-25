@@ -1,0 +1,263 @@
+{
+  "run": {
+    "algo": "rsl_rl_student_finetune",
+    "task": "Go2FootStand",
+    "sim_backend": "mujoco",
+    "device": "cuda",
+    "collector_device": null,
+    "log_dir": "/home/xander/Code/Others/UniLab-Copy/logs/rsl_rl_student_finetune/Go2FootStand/2026-05-24_23-11-48_mujoco",
+    "start_time_utc": "2026-05-25T06:11:48.079752+00:00",
+    "hostname": "xander-PCL",
+    "user": "xander",
+    "git": {
+      "commit": "b5082db7494c54583f4f3d01a40cf60a45f6b0e5",
+      "branch": "go2-footstand-sim2real",
+      "dirty": true
+    },
+    "hardware": {
+      "platform": "Linux"
+    },
+    "wandb": {
+      "project": "unilab",
+      "entity": null,
+      "name": "rsl_rl_student_finetune__Go2FootStand__2026-05-24_23-11-48_mujoco",
+      "group": "Go2FootStand",
+      "job_type": "rsl_rl_student_finetune",
+      "tags": [
+        "rsl_rl_student_finetune",
+        "Go2FootStand",
+        "mujoco",
+        "user-xander"
+      ],
+      "notes": null,
+      "mode": null
+    },
+    "configured_seed": 1,
+    "configured_seed_source": "algo.seed",
+    "effective_seed": 1
+  },
+  "config": {
+    "algo": {
+      "algo": "rsl_rl_student_finetune",
+      "algo_log_name": "rsl_rl_student_finetune",
+      "seed": 1,
+      "num_envs": 1024,
+      "num_steps_per_env": 24,
+      "max_iterations": 100000,
+      "save_interval": 100,
+      "empirical_normalization": true,
+      "runner_class_name": "OnPolicyRunner",
+      "obs_groups": {
+        "actor": [
+          "actor"
+        ],
+        "critic": [
+          "critic"
+        ]
+      },
+      "experiment_name": "student_finetune",
+      "run_name": "",
+      "resume": false,
+      "load_run": "logs/rsl_rl_student_finetune/Go2FootStand/2026-05-24_09-42-19_mujoco",
+      "checkpoint": -1,
+      "resume_path": null,
+      "policy": {
+        "init_noise_std": 0.5,
+        "actor_hidden_dims": [
+          512,
+          256,
+          128
+        ],
+        "critic_hidden_dims": [
+          512,
+          256,
+          128
+        ],
+        "activation": "elu",
+        "class_name": "ActorCritic"
+      },
+      "algorithm": {
+        "class_name": "unilab.algos.torch.rsl_rl_ppo:TeacherRegularizedPPO",
+        "value_loss_coef": 1.0,
+        "use_clipped_value_loss": true,
+        "clip_param": 0.2,
+        "entropy_coef": 0.005,
+        "num_learning_epochs": 5,
+        "num_mini_batches": 4,
+        "learning_rate": 0.001,
+        "schedule": "adaptive",
+        "gamma": 0.99,
+        "lam": 0.95,
+        "desired_kl": 0.01,
+        "target_kl_stop": null,
+        "max_grad_norm": 1.0,
+        "adaptive_kl_beta": 0.9,
+        "adaptive_lr_growth": 1.1,
+        "adaptive_lr_decay": 1.2,
+        "adaptive_lr_update_interval": 5,
+        "metrics_interval": 8,
+        "finite_check_interval": 8,
+        "enable_compile": false,
+        "warmup_strict_iters": 10,
+        "warmup_metrics_interval": 2,
+        "warmup_finite_check_interval": 2,
+        "disable_finite_checks": true,
+        "teacher_regularization": {
+          "enabled": true,
+          "action_loss_coef": 0.05,
+          "kl_loss_coef": 0.01
+        }
+      }
+    },
+    "distill": {
+      "algo_log_name": "rsl_rl_distill",
+      "task_name": "Go2FootStand",
+      "load_run": "logs/rsl_rl_distill/Go2FootStand/2026-05-24_02-37-41_mujoco",
+      "checkpoint": -1,
+      "strict": true,
+      "log_root": null
+    },
+    "critic": {
+      "algo_log_name": "rsl_rl_ppo",
+      "task_name": "Go2FootStand",
+      "load_run": "logs/rsl_rl_ppo/Go2FootStand/2026-05-23_23-34-11_mujoco",
+      "checkpoint": -1,
+      "strict": true,
+      "log_root": null
+    },
+    "teacher": {
+      "algo_log_name": "rsl_rl_ppo",
+      "task_name": "Go2FootStand",
+      "load_run": "logs/rsl_rl_ppo/Go2FootStand/2026-05-23_23-34-11_mujoco",
+      "checkpoint": -1,
+      "strict": true,
+      "log_root": null
+    },
+    "teacher_model": {
+      "class_name": "rsl_rl.models.MLPModel",
+      "hidden_dims": [
+        512,
+        256,
+        128
+      ],
+      "activation": "elu",
+      "obs_normalization": true,
+      "distribution_cfg": {
+        "class_name": "rsl_rl.modules.distribution.GaussianDistribution",
+        "init_std": 0.5,
+        "std_type": "scalar"
+      }
+    },
+    "distillation": {
+      "teacher_obs_group": "obs",
+      "student_frame_dim": 45,
+      "student_drop_start": 0,
+      "student_drop_dim": 3
+    },
+    "training": {
+      "task_name": "Go2FootStand",
+      "device": null,
+      "logger": "tensorboard",
+      "wandb_project": "unilab",
+      "wandb_entity": null,
+      "wandb_group": null,
+      "wandb_job_type": null,
+      "wandb_name": null,
+      "wandb_tags": [],
+      "wandb_notes": null,
+      "wandb_mode": null,
+      "sim_backend": "mujoco",
+      "nan_guard": {
+        "enabled": false,
+        "buffer_size": 100,
+        "max_envs_to_dump": 5,
+        "output_dir": null
+      },
+      "play_only": false,
+      "no_play": true,
+      "play_render_mode": "auto",
+      "play_env_num": 16,
+      "render_spacing": 1.0,
+      "play_steps": 200,
+      "cam_distance": 6.0,
+      "cam_elevation": -20.0,
+      "cam_azimuth": 90.0,
+      "cam_lookat": null,
+      "cam_tracking": false,
+      "cam_tracking_env_idx": 0,
+      "cam_tracking_extra_envs": 2,
+      "log_root": null,
+      "num_timesteps": null,
+      "log_dir": null
+    },
+    "env": {
+      "sim_dt": 0.004,
+      "obs_history_len": 15,
+      "energy_termination_threshold": 200.0,
+      "noise_config": {
+        "level": 1.0,
+        "scale_joint_angle": 0.01,
+        "scale_joint_vel": 1.5,
+        "scale_gyro": 0.2,
+        "scale_gravity": 0.05,
+        "scale_linvel": 0.1
+      },
+      "control_config": {
+        "action_scale": 0.3
+      },
+      "domain_rand": {
+        "randomize_floor_friction": true,
+        "floor_friction_range": [
+          0.4,
+          1.0
+        ],
+        "randomize_link_mass": true,
+        "link_mass_scale_range": [
+          0.9,
+          1.1
+        ],
+        "torso_added_mass_range": [
+          -1.0,
+          1.0
+        ],
+        "randomize_torso_com": true,
+        "torso_com_offset_range": [
+          -0.05,
+          0.05
+        ],
+        "randomize_dof_armature": true,
+        "dof_armature_scale_range": [
+          1.0,
+          1.05
+        ],
+        "randomize_reset_joint_qpos": true,
+        "reset_joint_qpos_range": [
+          -0.05,
+          0.05
+        ]
+      }
+    },
+    "reward": {
+      "scales": {
+        "height": 2.0,
+        "orientation": 2.0,
+        "contact": -1.0,
+        "action_rate": -0.01,
+        "termination": -2.0,
+        "dof_pos_limits": -0.5,
+        "torques": 0.0,
+        "pose": -0.1,
+        "penalty_contact": -0.2,
+        "tar": 0.8,
+        "rear_feet_contact": 0.5,
+        "front_leg_motion": -0.05,
+        "upright_stability": -0.2,
+        "stay_still": -0.1,
+        "energy": -0.003,
+        "dof_acc": -2.5e-07
+      },
+      "tracking_sigma": 0.25,
+      "base_height_target": 0.3
+    }
+  }
+}
