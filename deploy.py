@@ -75,6 +75,9 @@ DEFAULT_PRE_FOOTSTAND_POSE_TIMEOUT = 2.5
 DEFAULT_PRE_FOOTSTAND_POSE_TOLERANCE = 0.16
 DEFAULT_PRE_FOOTSTAND_DQ_TOLERANCE = 1.0
 DEFAULT_RELAX_HOLD_SECONDS = 0.0
+DEFAULT_TORQUE_LIMIT_SCALE = 1.0
+DEFAULT_STARTUP_TORQUE_LIMIT_SCALE = DEFAULT_TORQUE_LIMIT_SCALE
+DEFAULT_STARTUP_TORQUE_RAMP_SECONDS = 0.0
 VELOCITY_STATE = "velocity"
 FOOTSTAND_STATE = "footstand"
 FOOTSTAND_SWITCH_BUTTON = "L1"
@@ -1419,9 +1422,17 @@ if __name__ == "__main__":
     )
     parser.add_argument("--stand-target", nargs=ACT_DIM, type=float, default=stand_q_real)
     parser.add_argument("--enable-stand-torque-limit", action="store_true")
-    parser.add_argument("--torque-limit-scale", type=float, default=0.65)
-    parser.add_argument("--startup-torque-limit-scale", type=float, default=0.45)
-    parser.add_argument("--startup-torque-ramp-seconds", type=float, default=3.0)
+    parser.add_argument("--torque-limit-scale", type=float, default=DEFAULT_TORQUE_LIMIT_SCALE)
+    parser.add_argument(
+        "--startup-torque-limit-scale",
+        type=float,
+        default=DEFAULT_STARTUP_TORQUE_LIMIT_SCALE,
+    )
+    parser.add_argument(
+        "--startup-torque-ramp-seconds",
+        type=float,
+        default=DEFAULT_STARTUP_TORQUE_RAMP_SECONDS,
+    )
     parser.add_argument("--disable-torque-limit", action="store_true")
     parser.add_argument(
         "--enable-sim-torque-limit",

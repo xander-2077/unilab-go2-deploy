@@ -24,6 +24,7 @@ LOWCMD_WRITE_DT = 0.005
 LOWCMD_MOTOR_MODE = 0x01
 LOWCMD_TARGET_DQ = 0.0
 LOWCMD_FEEDFORWARD_TAU = 0.0
+DEFAULT_TORQUE_LIMIT_SCALE = 1.0
 
 
 @dataclass
@@ -52,7 +53,7 @@ class Robot():
         network_interface=None,
         domain_id=None,
         ready_timeout=None,
-        torque_limit_scale=0.65,
+        torque_limit_scale=DEFAULT_TORQUE_LIMIT_SCALE,
         torque_limit_enabled=None,
     ):
         """

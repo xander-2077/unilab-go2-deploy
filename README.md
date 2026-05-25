@@ -94,7 +94,7 @@ Useful options:
 ```bash
 ./run.sh python deploy.py --debug-command
 ./run.sh python deploy.py --dry-run 8
-./run.sh python deploy.py --torque-limit-scale 0.65 --startup-torque-limit-scale 0.45 --debug-command
+./run.sh python deploy.py --torque-limit-scale 1.0 --startup-torque-limit-scale 1.0 --startup-torque-ramp-seconds 0 --debug-command
 ./run.sh python deploy.py --stand-seconds 2
 ./run.sh python deploy.py --post-stand-delay 2.0
 ./run.sh python deploy.py --pre-footstand-hold-seconds 0.75
@@ -104,9 +104,9 @@ Useful options:
 ```
 
 By default, real-robot commands are protected by a PD torque limiter in `robot.py`.
-It estimates `kp * (q_cmd - q_measured) - kd * dq` before each lowcmd publish and pulls `q_cmd` back when the estimate exceeds the active scaled URDF torque limits.
-The default policy-control limit ramps from `0.45 *` to `0.65 *` the URDF limits over the first 3 seconds, then holds `0.65 *` for the task.
-If the robot still overloads, lower `--torque-limit-scale`; if it cannot rise but `tau_hits` stays high, raise it gradually while watching motor temperature and error lights.
+It estimates `kp * (q_cmd - q_measured) - kd * dq` before each lowcmd publish and pulls `q_cmd` back when the estimate exceeds the active URDF torque limits.
+The default policy-control limit uses `--torque-limit-scale 1.0` with no startup ramp, so the deploy-side limiter no longer applies the old `0.65` scale.
+If the robot overloads, lower `--torque-limit-scale`; if it cannot rise but `tau_hits` stays high, raise it gradually while watching motor temperature and error lights.
 
 When running against `unitree_mujoco` with `--sim`, the deploy-side torque limiter
 is disabled by default so the LowCmd stream is the same position-control pipeline

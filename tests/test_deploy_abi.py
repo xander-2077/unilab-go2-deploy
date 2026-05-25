@@ -133,6 +133,9 @@ class Go2FootStandAbiTest(unittest.TestCase):
         self.assertAlmostEqual(robot.Δq_real[10], -0.2, places=5)
 
     def test_robot_torque_limiter_default_matches_target_pipeline(self) -> None:
+        self.assertEqual(deploy.DEFAULT_TORQUE_LIMIT_SCALE, 1.0)
+        self.assertEqual(deploy.DEFAULT_STARTUP_TORQUE_LIMIT_SCALE, 1.0)
+        self.assertEqual(deploy.DEFAULT_STARTUP_TORQUE_RAMP_SECONDS, 0.0)
         self.assertTrue(Robot._default_torque_limit_enabled(is_sim=False, requested=None))
         self.assertFalse(Robot._default_torque_limit_enabled(is_sim=True, requested=None))
         self.assertTrue(Robot._default_torque_limit_enabled(is_sim=True, requested=True))
